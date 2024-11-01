@@ -19,6 +19,8 @@ from transvae.data import vae_data_gen, make_std_mask
 from transvae.loss import vae_loss, trans_vae_loss, aae_loss, wae_loss, deep_isometry_loss
 from transvae.DDP import reduce_tensor
 
+from pytorch_metric_learning import losses
+
 import torch.distributed as dist
 import torch.utils.data.distributed
 
@@ -149,7 +151,7 @@ class VAEShell():
             self.optimizer.load_state_dict(self.current_state['optimizer_state_dict'])
             
     def train(self, train_mols, val_mols, train_props=None, val_props=None,
-              epochs=200, use_isometry_loss=False, pairwise_distances=None, inputs_w_distances=None,
+              epochs=200, use_contrastive_loss=False, pairwise_distances=None, inputs_w_distances=None,
               save=True, save_freq=None, log=True, log_dir='trials', comet_experiment=None):
         """
         Train model and validate
@@ -168,16 +170,26 @@ class VAEShell():
             save_freq (int): Frequency with which to save model checkpoints
             log (bool): If true, writes training metrics to log file
             log_dir (str): Directory to store log files
+            use_contrastive_loss: (bool) If true, uses contrastive loss,
+
+        Notes:
+        - use_contrastive_loss, the arguments being provided to it are call use_isometry_loss due to historical testing of an isometry loss method.
         """
         torch.backends.cudnn.benchmark = True #optimize run-time for fixed model input size
         structure_predictor = None # DEPRECATED
         ### Prepare data iterators
-        train_data = vae_data_gen(train_mols, self.src_len, self.name, train_props, 
-                                  char_dict=self.params['CHAR_DICT'], mask_label_percent=self.params['mask_label_percent'])
-        val_data   = vae_data_gen(  val_mols, self.src_len, self.name,   val_props, 
-                                  char_dict=self.params['CHAR_DICT'], mask_label_percent=self.params['mask_label_percent'])
+        train_data, binners = vae_data_gen(train_mols, self.src_len, self.name, train_props, 
+                                  char_dict=self.params['CHAR_DICT'], 
+                                  mask_label_percent=self.params['mask_label_percent']
+        )
+        val_data, _   = vae_data_gen(  val_mols, self.src_len, self.name,   val_props, 
+                                  char_dict=self.params['CHAR_DICT'], 
+                                  mask_label_percent=self.params['mask_label_percent'],
+                                  binners=binners
+                                  )
         
         # special input for isometry learning
+        use_isometry_loss=False
         if use_isometry_loss:
             logging.info(f"generating encoded sequences for isometry loss")
             assert inputs_w_distances is not None, "ERROR: Must provide inputs with distances"
@@ -231,6 +243,9 @@ class VAEShell():
                 log_file.write('epoch,batch_idx,data_type,tot_loss,recon_loss,pred_loss,'\
                                'kld_loss,prop_bce_loss,disc_loss,mmd_loss,isometry_loss,run_time\n')
             log_file.close()
+
+        ### Contrastive loss
+        contrastive_loss = losses.SupConLoss() # supervised contrastive loss
 
         ### Initialize Annealer
         kl_annealer = KLAnnealer(self.params['BETA_INIT'], self.params['BETA'],
@@ -294,6 +309,7 @@ class VAEShell():
                 avg_disc_losses     = []
                 avg_mmd_losses      = []
                 avg_isometry_losses     = []
+                avg_contrastive_losses = []
                 start_run_time = perf_counter()
                 
                 for i in range(self.params['BATCH_CHUNKS']):
@@ -334,6 +350,12 @@ class VAEShell():
                                                                             true_prop, pred_prop,
                                                                             self.params['CHAR_WEIGHTS'], self,
                                                                             beta, beta_property=beta_property)
+                        if use_contrastive_loss:
+                            _contrastive_loss = contrastive_loss(mu, true_prop)
+                            loss = loss + _contrastive_loss
+                        else:
+                            _contrastive_loss = torch.tensor(0.0)
+
                         avg_bcemask_losses.append(bce_mask.item())
                         
                     if self.model_type == 'aae': #the aae loss is calculated in the forward function due to the 2 backward passes
@@ -399,6 +421,11 @@ class VAEShell():
                             isometry_loss = reduce_tensor(isometry_loss)
                         else:
                             isometry_loss = torch.tensor(0.0)
+
+                        if use_contrastive_loss:
+                            _contrastive_loss = reduce_tensor(_contrastive_loss)
+                        else:
+                            _contrastive_loss = torch.tensor(0.0)
                     
                         avg_losses.append(  loss_reduced.item())
                     else:
@@ -407,6 +434,7 @@ class VAEShell():
                     avg_kld_losses.append(           kld.item())
                     avg_prop_bce_losses.append( prop_bce.item())
                     avg_isometry_losses.append(    isometry_loss.item())
+                    avg_contrastive_losses.append( _contrastive_loss.item())
 
                     if not self.model_type == 'aae': #the aae backpropagates in the loss function
                         loss.backward()
@@ -434,7 +462,8 @@ class VAEShell():
 
                 avg_kld      = np.mean(avg_kld_losses)
                 avg_prop_bce = np.mean(avg_prop_bce_losses)
-                avg_rmsd     = np.mean(avg_isometry_losses)
+                # avg_rmsd     = np.mean(avg_isometry_losses)
+                avg_rmsd     = np.mean(avg_contrastive_losses)
                 
                 losses.append(avg_loss)
                 recon_losses.append(avg_bce)
@@ -481,6 +510,8 @@ class VAEShell():
                 avg_disc_losses     = []
                 avg_mmd_losses      = []
                 avg_isometry_losses     = []
+                avg_contrastive_losses = []
+
                 start_run_time = perf_counter()
                 for i in range(self.params['BATCH_CHUNKS']):
                     batch_data = data[i*self.chunk_size:(i+1)*self.chunk_size,:]
@@ -521,6 +552,12 @@ class VAEShell():
                                                                             self.params['CHAR_WEIGHTS'], self,
                                                                             beta, beta_property=beta_property)
                         avg_bcemask_losses.append(bce_mask.item())
+
+                        if use_contrastive_loss:
+                            _contrastive_loss = contrastive_loss(mu, true_prop)
+                            loss = loss + _contrastive_loss
+                        else:
+                            _contrastive_loss = torch.tensor(0.0)
                         
                     if self.model_type == 'aae':
                         loss, bce, kld, prop_bce, disc_loss = self.model(src, tgt, true_prop,self.params['CHAR_WEIGHTS'], beta,
@@ -584,6 +621,11 @@ class VAEShell():
                             isometry_loss = reduce_tensor(isometry_loss)
                         else:
                             isometry_loss = torch.tensor(0.0)
+                        
+                        if use_contrastive_loss:
+                            _contrastive_loss = reduce_tensor(_contrastive_loss)
+                        else:
+                            _contrastive_loss = torch.tensor(0.0)
 
                         avg_losses.append(     loss_reduced.item())
                     else:
@@ -592,6 +634,7 @@ class VAEShell():
                     avg_kld_losses.append(          kld.item())
                     avg_prop_bce_losses.append(prop_bce.item())
                     avg_isometry_losses.append(   isometry_loss.item())
+                    avg_contrastive_losses.append(_contrastive_loss.item())
 
                 stop_run_time = perf_counter()
                 run_time = round(stop_run_time - start_run_time, 5)
@@ -612,7 +655,9 @@ class VAEShell():
                 
                 avg_kld      = np.mean(avg_kld_losses)
                 avg_prop_bce = np.mean(avg_prop_bce_losses)
-                avg_rmsd     = np.mean(avg_isometry_losses)
+                # avg_rmsd     = np.mean(avg_isometry_losses)
+                avg_rmsd     = np.mean(avg_contrastive_losses)
+
                 losses.append(avg_loss)
                 recon_losses.append(avg_bce)
                 prop_losses.append(avg_prop_bce)

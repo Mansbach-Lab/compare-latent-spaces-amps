@@ -87,15 +87,21 @@ def train(args, comet_experiment=None):
         use_isometry_loss = False
 
     if use_isometry_loss:
-        logging.info("Using isometry loss")
-        logging.info(f"Loading precomputed pairwise distances from {args.pairwise_distances}")
+        logging.info("Using isometry/contrastive loss")
+        pairwise_distances = None
+        inputs_w_distances = None
+        # when true, using contrastive loss defined in as outlined in trans_models.py
+
+        # logging.info(f"Loading precomputed pairwise distances from {args.pairwise_distances}")
         # grab target distances ('labels')
-        assert args.pairwise_distances is not None, "ERROR: Must specify path to precomputed pairwise distances if using isometry loss"
-        if args.pairwise_distances is not None:
-            if args.pairwise_distances.endswith('.pkl'):
-                logging.info('Loading precomputed pairwise distances from {}'.format(args.pairwise_distances))
-                with open(args.pairwise_distances, 'rb') as f:
-                    pairwise_distances = pickle.load(f)
+        
+        ### commented out because we are not using the pairwise distances
+        # assert args.pairwise_distances is not None, "ERROR: Must specify path to precomputed pairwise distances if using isometry loss"
+        # if args.pairwise_distances is not None:
+        #     if args.pairwise_distances.endswith('.pkl'):
+        #         logging.info('Loading precomputed pairwise distances from {}'.format(args.pairwise_distances))
+        #         with open(args.pairwise_distances, 'rb') as f:
+        #             pairwise_distances = pickle.load(f)
                     # don't need to split into train/test because values
                     # are accessed by seqi_seqj pairs.
                     # seqi, seqj are sampled from the same set
@@ -103,16 +109,16 @@ def train(args, comet_experiment=None):
         # also grab subset of inputs that have pairwise distances
         # (i.e. the subset of inputs that were used to compute the distances)
         # in our peptide case only 1% of the data has corresponding pairwise distances
-        assert args.train_inputs_w_distances is not None, "ERROR: Must specify path to training inputs with pairwise distances if using isometry loss"
-        if args.train_inputs_w_distances is not None:
-            logging.info('Loading train inputs with pairwise distances from {}'.format(args.train_inputs_w_distances))
-            train_inputs_w_distances = pd.read_csv(args.train_inputs_w_distances) 
+        # assert args.train_inputs_w_distances is not None, "ERROR: Must specify path to training inputs with pairwise distances if using isometry loss"
+        # if args.train_inputs_w_distances is not None:
+        #     logging.info('Loading train inputs with pairwise distances from {}'.format(args.train_inputs_w_distances))
+        #     train_inputs_w_distances = pd.read_csv(args.train_inputs_w_distances) 
         
-        assert args.test_inputs_w_distances is not None, "ERROR: Must specify path to testing inputs with pairwise distances if using isometry loss"
-        if args.test_inputs_w_distances is not None:
-            logging.info('Loading test inputs with pairwise distances from {}'.format(args.test_inputs_w_distances))
-            test_inputs_w_distances = pd.read_csv(args.test_inputs_w_distances)
-        inputs_w_distances = (train_inputs_w_distances, test_inputs_w_distances)
+        # assert args.test_inputs_w_distances is not None, "ERROR: Must specify path to testing inputs with pairwise distances if using isometry loss"
+        # if args.test_inputs_w_distances is not None:
+        #     logging.info('Loading test inputs with pairwise distances from {}'.format(args.test_inputs_w_distances))
+        #     test_inputs_w_distances = pd.read_csv(args.test_inputs_w_distances)
+        # inputs_w_distances = (train_inputs_w_distances, test_inputs_w_distances)
     else:
         pairwise_distances = None
         inputs_w_distances = None

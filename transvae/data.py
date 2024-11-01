@@ -6,8 +6,11 @@ import math, copy, time, logging
 from torch.autograd import Variable
 
 from transvae.tvae_util import *
+from sklearn.preprocessing import KBinsDiscretizer
 
-def vae_data_gen(data, max_len=126, name=None, props=None, char_dict=None, d_pp_out=1, mask_label_percent=None, mask_rng_seed=42):
+def vae_data_gen(data, max_len=126, name=None, props=None, 
+                 char_dict=None, d_pp_out=1, 
+                 mask_label_percent=None, binners=None, mask_rng_seed=42):
     """
     Encodes input smiles to tensors with token ids
 
@@ -17,15 +20,20 @@ def vae_data_gen(data, max_len=126, name=None, props=None, char_dict=None, d_pp_
         char_dict (dict, req): Dictionary mapping tokens to integer id
         d_pp_out (int, opt): Number of property outputs. Default is 1
         mask_label_percent: percentage of labels to mask. Default is None
+        binners: list[KBinsDiscretizer], list of binners for each property output. Default is None
         mask_rng_seed: random seed for masking. Default is 42
     Returns:
         encoded_data (torch.tensor): Tensor containing encodings for each
                                      SMILES string
+        bins (list[KBinsDiscretizer]): List of binners for each property output, if binners is None
+
     Notes:
         - If props is None, a tensor of zeros is created
         - when using masked labels, the percentage to mask corresponds to the percentage of the full dataset,
             not the percentage of the batch, nor the percentage of the non-NaN labels. 
             E.g. even if only 10% of the full dataset is labelled, if mask_label_percent=0.1, then a random 10% of the full dataset will be masked.
+        - If binners are provided then they are used to discretize the property values. 
+            usually that means we are building thte validation set, and we want to use the same bins as the training set.
     """
     seq_list = data[:,0] #unpackage the smiles: mols is a list of lists of smiles (lists of characters) 
     if props is None:
@@ -40,6 +48,25 @@ def vae_data_gen(data, max_len=126, name=None, props=None, char_dict=None, d_pp_
         if len(props) < len(seq_list):
             _extender = np.array([np.nan]*((n_seqs-n_props)*n_prop_outputs)).reshape(-1,n_prop_outputs)
             props = np.concatenate((props, _extender), axis=0)
+        
+        print(f"n_seqs: {n_seqs}, n_props: {n_props}, n_prop_outputs: {n_prop_outputs}")
+        print("NOTE! binning property values...")
+        if binners is None:
+            binners = []
+            for _prop_output in range(n_prop_outputs):
+                binners.append(
+                    KBinsDiscretizer(n_bins=20, encode='ordinal', strategy='quantile')
+                )
+
+        labeled_indices = ~torch.isnan(torch.tensor(props).sum(dim=1))
+        props_binned_values = props.copy()
+        for _prop_output in range(n_prop_outputs):
+            binner = binners[_prop_output]
+            binned_values = binner.fit_transform(props[labeled_indices, _prop_output].reshape(-1, 1)).astype(int).flatten()
+            props_binned_values[labeled_indices, _prop_output] = binned_values
+        
+        props = props_binned_values
+        
     del data
 
     if mask_label_percent is not None:
@@ -61,7 +88,11 @@ def vae_data_gen(data, max_len=126, name=None, props=None, char_dict=None, d_pp_
         encoded_seq = [0] + encoded_seq
         encoded_data[j,               :-n_prop_outputs] = torch.tensor(encoded_seq)
         encoded_data[j,-n_prop_outputs:               ] = torch.tensor(props[j,:])
-    return encoded_data
+    
+    if binners is not None:
+        return encoded_data, binners
+    else:
+        return encoded_data, None
 
 def make_std_mask(tgt, pad):
     """

@@ -19,7 +19,7 @@ from transvae.data import vae_data_gen, make_std_mask
 from transvae.loss import vae_loss, trans_vae_loss, aae_loss, wae_loss, deep_isometry_loss
 from transvae.DDP import reduce_tensor
 
-from pytorch_metric_learning import losses
+from pytorch_metric_learning import ptlosses
 
 import torch.distributed as dist
 import torch.utils.data.distributed
@@ -245,7 +245,7 @@ class VAEShell():
             log_file.close()
 
         ### Contrastive loss
-        contrastive_loss = losses.SupConLoss() # supervised contrastive loss
+        contrastive_loss = ptlosses.SupConLoss() # supervised contrastive loss
 
         ### Initialize Annealer
         kl_annealer = KLAnnealer(self.params['BETA_INIT'], self.params['BETA'],

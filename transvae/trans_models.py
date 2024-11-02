@@ -352,7 +352,8 @@ class VAEShell():
                                                                             beta, beta_property=beta_property)
                         if use_contrastive_loss:
                             if true_prop.shape[1] == 1:
-                                _contrastive_loss = contrastive_loss(mu, true_prop.flatten())
+                                _normalized_mu = mu / torch.linalg.vector_norm(mu, dim=1, ord=2, keepdim=True)
+                                _contrastive_loss = contrastive_loss(_normalized_mu, true_prop.flatten())
                             else:
                                 error_msg = f"contrastive loss only supported for single property, not {true_prop.shape=}"
                                 raise ValueError(error_msg)
@@ -560,7 +561,8 @@ class VAEShell():
                         if use_contrastive_loss:
                             # _contrastive_loss = contrastive_loss(mu, true_prop)
                             if true_prop.shape[1] == 1:
-                                _contrastive_loss = contrastive_loss(mu, true_prop.flatten())
+                                _normalized_mu = mu / torch.linalg.vector_norm(mu, dim=1, ord=2, keepdim=True)
+                                _contrastive_loss = contrastive_loss(_normalized_mu, true_prop.flatten())
                             else:
                                 error_msg = f"contrastive loss only supported for single property, not {true_prop.shape=}"
                                 raise ValueError(error_msg)

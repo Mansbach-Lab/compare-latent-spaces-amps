@@ -253,7 +253,7 @@ class VAEShell():
         
         contrastive_kl_start = 0.01
         property_init = 0.0
-        property_final= 100.0
+        property_final= 100.0 if use_contrastive_loss is False else 0.0
         _total_epochs = epochs
         if self.n_epochs>0:
             _total_epochs = self.n_epochs + epochs

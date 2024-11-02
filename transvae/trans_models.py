@@ -351,7 +351,11 @@ class VAEShell():
                                                                             self.params['CHAR_WEIGHTS'], self,
                                                                             beta, beta_property=beta_property)
                         if use_contrastive_loss:
-                            _contrastive_loss = contrastive_loss(mu, true_prop)
+                            if true_prop.shape[1] == 1:
+                                _contrastive_loss = contrastive_loss(mu, true_prop.flatten())
+                            else:
+                                error_msg = f"contrastive loss only supported for single property, not {true_prop.shape=}"
+                                raise ValueError(error_msg)
                             loss = loss + _contrastive_loss
                         else:
                             _contrastive_loss = torch.tensor(0.0)
@@ -554,7 +558,12 @@ class VAEShell():
                         avg_bcemask_losses.append(bce_mask.item())
 
                         if use_contrastive_loss:
-                            _contrastive_loss = contrastive_loss(mu, true_prop)
+                            # _contrastive_loss = contrastive_loss(mu, true_prop)
+                            if true_prop.shape[1] == 1:
+                                _contrastive_loss = contrastive_loss(mu, true_prop.flatten())
+                            else:
+                                error_msg = f"contrastive loss only supported for single property, not {true_prop.shape=}"
+                                raise ValueError(error_msg)
                             loss = loss + _contrastive_loss
                         else:
                             _contrastive_loss = torch.tensor(0.0)

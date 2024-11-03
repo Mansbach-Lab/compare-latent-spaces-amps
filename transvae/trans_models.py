@@ -180,12 +180,12 @@ class VAEShell():
         ### Prepare data iterators
         train_data, binners = vae_data_gen(train_mols, self.src_len, self.name, train_props, 
                                   char_dict=self.params['CHAR_DICT'], 
-                                  mask_label_percent=self.params['mask_label_percent']
+                                  mask_label_percent=self.params['mask_label_percent'], use_contrastive_loss=use_contrastive_loss
         )
         val_data, _   = vae_data_gen(  val_mols, self.src_len, self.name,   val_props, 
                                   char_dict=self.params['CHAR_DICT'], 
                                   mask_label_percent=self.params['mask_label_percent'],
-                                  binners=binners
+                                  binners=binners, use_contrastive_loss=use_contrastive_loss
                                   )
         
         # special input for isometry learning

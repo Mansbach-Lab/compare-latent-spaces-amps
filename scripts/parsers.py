@@ -76,7 +76,7 @@ def train_parser():
     
     # property predictor parameters
     parser.add_argument('--property_predictor', choices=['ON', 'OFF'], default='OFF', type=str)
-    parser.add_argument('--d_property_predictor', default=2, type=int)
+    parser.add_argument('--d_property_predictor', default=64, type=int)
     parser.add_argument('--depth_property_predictor', default=2, type=int)
     parser.add_argument('--type_property_predictor', choices=['decision_tree', 'deep_net'], default='deep_net', type=str)
     parser.add_argument('--d_pp_out', default=1, type=int, help='Number of output dimensions for property predictor')

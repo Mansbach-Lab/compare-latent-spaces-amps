@@ -86,7 +86,7 @@ def train_parser():
                             in the same order as the properties in the properties file')
     
     parser.add_argument('--hardware', choices=['cpu', 'gpu'], required=True, type=str)
-    parser.add_argument('--device_id', default=0, type=int)
+    parser.add_argument('--device_id',  type=int, default=[0], nargs='+', help='visible gpus')
 
     ###############################
     ### Hyperparameters

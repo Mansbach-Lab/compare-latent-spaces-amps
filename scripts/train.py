@@ -34,6 +34,17 @@ def train(args, comet_experiment=None):
     else: 
         args.property_predictor = False
     
+    if args.hardware == 'gpu':
+        if args.DDP is False:
+            print("changed visible devices to ", args.device_id)
+            os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.device_id)
+
+            # check visible devices
+            print("visible devices: ", os.environ["CUDA_VISIBLE_DEVICES"])
+            print("device count: ", torch.cuda.device_count())
+            for i in range(torch.cuda.device_count()):
+                print(f"device {i} (pytorch device idx) name: ", torch.cuda.get_device_name(i))
+
     ### Build params dict from the parsed arguments
     params = {'ADAM_LR': args.adam_lr,
               'ANNEAL_START': args.anneal_start,

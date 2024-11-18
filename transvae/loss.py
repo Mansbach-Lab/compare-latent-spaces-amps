@@ -85,10 +85,18 @@ def trans_vae_loss(x, x_out, mu, logvar, true_len, pred_len, true_prop, pred_pro
                         )
                         prop_losses.append( _prop_loss )
                     else:
-                        _prop_loss = F.mse_loss(
-                            pred_prop[:,i][~torch.isnan(true_prop[:,i])], 
-                            true_prop[:,i][~torch.isnan(true_prop[:,i])]
-                        )
+                        # check if true_prop is all nan
+                        # if it is, ensure the computed loss is 0
+                        if len(true_prop[~torch.isnan(true_prop[:,i])]) == 0:
+                            _prop_loss = F.mse_loss(
+                                pred_prop[:,i], 
+                                pred_prop[:,i], 
+                            )
+                        else:
+                            _prop_loss = F.mse_loss(
+                                pred_prop[:,i][~torch.isnan(true_prop[:,i])], 
+                                true_prop[:,i][~torch.isnan(true_prop[:,i])]
+                            )
                         prop_losses.append( _prop_loss )
                 bce_prop = torch.sum(torch.stack(prop_losses))
             

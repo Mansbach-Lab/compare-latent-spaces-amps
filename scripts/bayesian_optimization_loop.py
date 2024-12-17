@@ -84,12 +84,20 @@ def run_optimization(i, params, model, nonlinear_svr, pca, char_dict, minimize_o
     # Get results
     return f"run_{i}", _optimizer.optimization_results
 
-def parallel_optimization(params, model, nonlinear_svr, pca, char_dict, minimize_or_maximize, train_X, train_Y, N_CPUS):
-    results = dict(Parallel(n_jobs=N_CPUS)(
-        delayed(run_optimization)(i, params, model, nonlinear_svr, pca, char_dict, minimize_or_maximize, train_X, train_Y) for i in range(params['n_bo_runs'])
+def parallel_optimization(params, model, nonlinear_svr, dimensionality_reducers, char_dict, minimize_or_maximize, train_Xs, train_Ys, N_CPUS):
+    
+    if params['n_different_initializations'] == 1:
+        results = dict(Parallel(n_jobs=N_CPUS)(
+            delayed(run_optimization)(i, params, model, nonlinear_svr, dimensionality_reducers[0], char_dict, minimize_or_maximize, train_Xs[0], train_Ys[0]) for i in range(params['n_bo_runs'])
+            )
         )
-    )
-    return results
+        return results
+    else:    
+        results = dict(Parallel(n_jobs=N_CPUS)(
+            delayed(run_optimization)(i, params, model, nonlinear_svr, dimensionality_reducers[i], char_dict, minimize_or_maximize, train_Xs[i], train_Ys[i]) for i in range(params['n_bo_runs'])
+            )
+        )
+        return results
 
 def main(data_X, data_Y, params):
 
@@ -121,9 +129,39 @@ def main(data_X, data_Y, params):
     #########################################
     # build a dimensionality reduction method
     logging.info("building PCA w/ {N_PCA_COMPONENTS} components...")
-    pca = PCA(n_components=N_PCA_COMPONENTS)
-    pca.fit(mu)
-    pca_mu = pca.transform(mu)
+    dimensionality_reducers = []
+    train_Xs = []
+    train_Ys = []
+    for i in range(params['n_different_initializations']):
+        _pca = PCA(n_components=N_PCA_COMPONENTS)
+            
+        _pca.fit(mu[i*params['n_initialization_points']:(i+1)*params['n_initialization_points']])
+        _pca_mu = _pca.transform(
+            mu[i*params['n_initialization_points']:(i+1)*params['n_initialization_points']]
+        )
+        dimensionality_reducers.append(_pca)
+
+        # 
+        if isinstance(_pca_mu, np.ndarray):
+            train_X = torch.from_numpy(_pca_mu)
+        elif isinstance(_pca_mu, pd.DataFrame):
+            train_X = torch.from_numpy(_pca_mu.values)
+        elif isinstance(_pca_mu, pd.Series):
+            train_X = torch.from_numpy(_pca_mu.values)
+        
+        train_Xs.append(train_X)
+
+        train_Y = data_Y[i*params['n_initialization_points']:(i+1)*params['n_initialization_points']]
+        if isinstance(train_Y, np.ndarray):
+            train_Y = torch.from_numpy(train_Y)
+        elif isinstance(train_Y, pd.DataFrame):
+            train_Y = torch.from_numpy(train_Y.values)
+        elif isinstance(train_Y, pd.Series):
+            train_Y = torch.from_numpy(train_Y.values)
+
+        if train_Y.dim() == 1:
+            train_Y.unsqueeze_(1)
+        train_Ys.append(train_Y)
 
     #########################################
     # build a nonlinear SVR ORACLE
@@ -132,34 +170,13 @@ def main(data_X, data_Y, params):
         nonlinear_svr = make_nonlinear_svr( params['prediction_target'] )
     else:
         raise NotImplementedError("Only mic svr is supported at the moment")
-
-    #########################################
-    # 
-    if isinstance(pca_mu, np.ndarray):
-        train_X = torch.from_numpy(pca_mu)
-    elif isinstance(pca_mu, pd.DataFrame):
-        train_X = torch.from_numpy(pca_mu.values)
-    elif isinstance(pca_mu, pd.Series):
-        train_X = torch.from_numpy(pca_mu.values)
-
-    train_Y = data_Y
-    if isinstance(train_Y, np.ndarray):
-        train_Y = torch.from_numpy(train_Y)
-    elif isinstance(train_Y, pd.DataFrame):
-        train_Y = torch.from_numpy(train_Y.values)
-    elif isinstance(train_Y, pd.Series):
-        train_Y = torch.from_numpy(train_Y.values)
     
-    if train_Y.dim() == 1:
-        train_Y.unsqueeze_(1)
-
-
     #########################################
     # perform optimization
     logging.info(f"Running BO for {params['n_bo_runs']} runs, each with {params['n_bo_iters']} oracle calls/BO loop iterations...")
 
     minimize_or_maximize = "minimize" if params["prediction_target"]=="log10_mic" else "maximize"
-    results = parallel_optimization(params, model, nonlinear_svr, pca, char_dict, minimize_or_maximize, train_X, train_Y, params['N_CPUS'])
+    results = parallel_optimization(params, model, nonlinear_svr, dimensionality_reducers, char_dict, minimize_or_maximize, train_Xs, train_Ys, params['N_CPUS'])
 
     return results
 
@@ -178,6 +195,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_bo_runs',               type=int, default=  5)
     parser.add_argument('--n_bo_iters',              type=int, default=100)
     parser.add_argument('--n_initialization_points', type=int, default=100)
+    parser.add_argument('--n_different_initializations', type=int, default=1)
     parser.add_argument('--n_pca_components',        type=int, default=  5)
     parser.add_argument('--prediction_target', type=str, default='log10_mic', choices=['log10_mic', 'log10_HC50'])
     parser.add_argument('--n_cpus', type=int, default=1)
@@ -219,6 +237,7 @@ if __name__ == '__main__':
     N_BO_RUNS              = args.n_bo_runs
     N_BO_ITERS             = args.n_bo_iters
     N_INITALIZATION_POINTS = args.n_initialization_points
+    N_DIFFERENT_INITIALIZATIONS = args.n_different_initializations
     N_PCA_COMPONENTS       = args.n_pca_components
     N_CPUS                 = args.n_cpus
 
@@ -244,7 +263,10 @@ if __name__ == '__main__':
     # load data
     train_seqs_to_prop = pd.read_csv(seq2prop_fpath)
     
-    sampled_seqs_to_prop = train_seqs_to_prop.sample(N_INITALIZATION_POINTS, ignore_index=True, random_state=42)
+    sampled_seqs_to_prop = train_seqs_to_prop.sample(N_INITALIZATION_POINTS*N_DIFFERENT_INITIALIZATIONS, 
+                                                     ignore_index=True, 
+                                                     random_state=42
+    )
     
     sampled_seqs  = sampled_seqs_to_prop[['sequence']]
     sampled_props = sampled_seqs_to_prop[args.prediction_target] # LEAST GENERAL PART OF THE CODE
@@ -254,6 +276,7 @@ if __name__ == '__main__':
     params['n_bo_iters'] = N_BO_ITERS
     params['n_bo_runs'] = N_BO_RUNS
     params['n_initialization_points'] = N_INITALIZATION_POINTS
+    params['n_different_initializations'] = N_DIFFERENT_INITIALIZATIONS
     params['n_pca_components'] = N_PCA_COMPONENTS
     params['prediction_target'] = args.prediction_target
     

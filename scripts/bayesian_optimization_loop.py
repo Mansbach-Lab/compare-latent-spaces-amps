@@ -189,6 +189,7 @@ if __name__ == '__main__':
     parser.add_argument('--seq2prop_fpath',  type=str, required=True)
     parser.add_argument('--char_dict_fpath', type=str, required=True)
     parser.add_argument('--chkpt_fpath',     type=str, required=True)
+    parser.add_argument('--output_dir',      type=str, required=False, default='./')
     
     parser.add_argument("--use_esm", type=str, default='no', choices=['yes', 'no'])
     parser.add_argument('--use_mic_svr', type=str, default='yes', choices=['yes', 'no'])
@@ -241,8 +242,9 @@ if __name__ == '__main__':
     N_PCA_COMPONENTS       = args.n_pca_components
     N_CPUS                 = args.n_cpus
 
-    data_dir  = args.data_dir
-    seq2prop_fpath = args.seq2prop_fpath
+    data_dir   = args.data_dir
+    output_dir = args.output_dir
+    seq2prop_fpath  = args.seq2prop_fpath
     char_dict_fpath = args.char_dict_fpath
     chkpt_fpath = args.chkpt_fpath
 
@@ -282,6 +284,7 @@ if __name__ == '__main__':
     
     params["chkpt_fpath"] = chkpt_fpath
     params['char_dict'] = char_dict
+    params['output_dir'] = output_dir
     
     params["use_esm"] = USE_ESM
     if USE_ESM:
@@ -298,7 +301,7 @@ if __name__ == '__main__':
 
     #########################################
     # save results
-    output_fpath = f"{data_dir}bayesian_optimization_results_{chkpt_fpath.split('/')[1]}_{params['prediction_target']}.pkl"
+    output_fpath = f"{output_dir}bayesian_optimization_results_{chkpt_fpath.split('/')[1]}_{params['prediction_target']}.pkl"
     if USE_ESM:
         output_fpath = output_fpath.replace(".pkl", "_esm.pkl")
     results['params'] = params

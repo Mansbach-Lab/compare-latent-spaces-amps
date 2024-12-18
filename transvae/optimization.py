@@ -309,7 +309,10 @@ class OptimizeInReducedLatentSpace():
             if i%100==0:
                 _run = self.params.get("run", "default")
                 _name = self.params.get("chkpt_fpath", "default").split('/')[1]
-                with open(f"optimization_results_{_name}_run{_run}.pkl", "wb") as f:
+                _output_dir = self.params.get("output_dir", "./")
+                if _output_dir[-1]!="/":
+                    _output_dir+="/"
+                with open(f"{_output_dir}optimization_results_{_name}_run{_run}.pkl", "wb") as f:
                     pkl.dump(self.optimization_results, f)
 
         print("Optimization complete")

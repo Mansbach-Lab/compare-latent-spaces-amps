@@ -76,8 +76,19 @@ def train(args, comet_experiment=None):
     if args.property_predictor:
         assert args.train_props_path is not None and args.test_props_path is not None, \
         "ERROR: Must specify files with train/test properties if training a property predictor"
-        train_props = pd.read_csv(args.train_props_path).to_numpy()
-        test_props  = pd.read_csv( args.test_props_path).to_numpy()
+        
+        if "_mic_" in args.train_props_path:
+            train_props = pd.read_csv(args.train_props_path)
+            test_props  = pd.read_csv( args.test_props_path)
+
+            train_props = train_props["log10mic"].to_numpy()
+            test_props  = test_props[ "log10mic"].to_numpy()
+
+            train_props[train_props == 1000.0] = np.nan
+            test_props[  test_props == 1000.0] = np.nan
+        else:
+            train_props = pd.read_csv(args.train_props_path).to_numpy()
+            test_props  = pd.read_csv( args.test_props_path).to_numpy()
         
         if (args.prediction_types is None) or (set(args.prediction_types) == set(["classification"])):
             train_props = train_props.astype(int)

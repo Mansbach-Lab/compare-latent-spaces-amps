@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import os
 import pickle as pkl
+import logging
 
 from transvae import trans_models
 from transvae.transformer_models import TransVAE
@@ -21,8 +22,11 @@ from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
 from botorch.utils import standardize
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from botorch.acquisition import UpperConfidenceBound, ExpectedImprovement
+from botorch.acquisition import UpperConfidenceBound, ExpectedImprovement, LogExpectedImprovement 
 from botorch.optim import optimize_acqf
+from botorch.utils.transforms import unnormalize, normalize
+from botorch.models.transforms.input import Normalize
+from botorch.models.transforms.outcome import Standardize
 
 # from ..oracles.AMPlify.src.AMPlify import Amplify
 
@@ -49,6 +53,16 @@ def decode_seq(encoded_seq, stoi):
     decoded_seq = decoded_seq.strip("<end>")
     return decoded_seq
 
+class IdentityPCA():
+    def __init__(self, n_components):
+        self.n_components = n_components
+    def fit(self, X):
+        return self
+    def transform(self, X):
+        return X
+    def inverse_transform(self, X):
+        return X
+
 
 class OptimizeInReducedLatentSpace():
     def __init__(self, 
@@ -56,7 +70,8 @@ class OptimizeInReducedLatentSpace():
                  property_oracle, 
                  dimensionality_reduction,
                  char_dict,
-                 minimize_or_maximize_score="maximize"
+                 minimize_or_maximize_score="maximize",
+                 params={}
         ):
         """
         Class to perform Bayesian Optimization in the reduced latent space of a generative model.
@@ -80,6 +95,8 @@ class OptimizeInReducedLatentSpace():
             If "maximize", the optimizer will attempt to maximize the score.
             If "minimize", the optimizer will attempt to minimize the score.
             The default is "maximize".
+        params : dict, optional
+            Additional options, mainly to check if using ESM or other generative models.
         """
         
         # Generative Model and Property Oracle setup
@@ -87,9 +104,10 @@ class OptimizeInReducedLatentSpace():
         self.char_dict = char_dict
         self.minimize_or_maximize_score = minimize_or_maximize_score
         self.property_oracle = property_oracle
+        self.params = params
 
         print("Testing property oracle...")
-        test_sequence = "A"*30
+        test_sequence = "MKKLLLLLLLLLLRRLAAASLKLSN"
         test_prediction = self.property_oracle.predict([test_sequence])
         if isinstance(test_prediction, tuple):
             raise ValueError("""Property Oracle must return a single value, not a tuple.
@@ -100,15 +118,20 @@ class OptimizeInReducedLatentSpace():
         self.dimensionality_reducer = dimensionality_reduction
         self.n_reduced_dims = self.dimensionality_reducer.n_components
 
+        self.normalize_data = params['normalize_data']
+        self.n_pca_components = params["n_pca_components"]
         # bounds for Upper Confidence Bound method of 'exploring' the latent space
-        self.bounds = torch.stack([torch.ones(self.n_reduced_dims)*(-10), torch.ones(self.n_reduced_dims)*10])
+        self.bounds_int = self.params["bounds_int"]
+        self.bounds = torch.stack([torch.ones(self.n_reduced_dims)*(-1)*(self.bounds_int), torch.ones(self.n_reduced_dims)*self.bounds_int])
+        self.standard_bounds = torch.stack([torch.zeros(self.n_reduced_dims), torch.ones(self.n_reduced_dims)] )
 
         self.optimization_results = {
             "iterations":[],
             "candidates":[],
             "candidate_scores":[],
-            "best_score":0.0,
-            "best_sequence":""
+            "best_objective_values":[],
+            "best_sequences":[],
+            'params':params
         }
 
     def decode_seq(self, encoded_seq:list[int]) -> str:
@@ -161,12 +184,25 @@ class OptimizeInReducedLatentSpace():
         train_Y : torch.Tensor
             The output data.
         """
-        model = SingleTaskGP(train_X, train_Y)
+        if self.normalize_data:
+            model = SingleTaskGP(
+                normalize(train_X, self.bounds), 
+                train_Y,
+                outcome_transform=Standardize(m=1),
+                #input_transform  =Normalize(d=self.n_reduced_dims, bounds=self.bounds)
+            )
+        else:
+            model = SingleTaskGP(
+                train_X,
+                train_Y,
+            )
+        
         mll = ExactMarginalLogLikelihood(model.likelihood, model)
+        mll.to(train_X)
         fit_gpytorch_mll(mll)
         return model
 
-    def optimize(self, train_X, train_Y, n_iters=10):
+    def optimize(self, train_X, train_Y, n_iters=10, n_restarts=5,verbose=False):
 
         train_X=train_X.to(float)
         train_Y=train_Y.to(float)
@@ -175,56 +211,174 @@ class OptimizeInReducedLatentSpace():
                 
         if self.optimization_results["iterations"]:
             last_iteration = self.optimization_results["iterations"][-1]
+            best_score = self.optimization_results["best_objective_values"][-1]
+            best_seq = self.optimization_results["best_sequences"][-1]
         else:
+            print("============================================\nStarting optimization...")
             last_iteration = 0
-        print("============================================\nStarting optimization...")
-        best_score = -1e6
-        best_seq = None
+
+            # get best from provided initialization data
+            if self.minimize_or_maximize_score=="minimize":
+                _idx = train_Y.argmin()
+                best_score = (-1.0)*train_Y.min().item()
+                train_Y = (-1.0)*train_Y
+            else:
+                _idx = train_Y.argmax() 
+                best_score = train_Y.max().item()
+
+            _inv_proj = self.dimensionality_reducer.inverse_transform(
+                train_X[[_idx]]
+            )
+            
+
+            if isinstance(_inv_proj, np.ndarray):
+                _inv_proj = torch.from_numpy(_inv_proj)
+            
+            _inv_proj = _inv_proj.to(torch.float32)
+            
+            if _inv_proj.dim() == 1:
+                _inv_proj.unsqueeze_(0)
+
+            with torch.no_grad():
+                if self.params.get("use_esm", False):
+                    _decode_inv_proj = self.generative_model.greedy_decode(_inv_proj)
+                    best_seq = _decode_inv_proj # ESM has its own decoding method
+                else:
+                    _decode_inv_proj = self.generative_model.greedy_decode(_inv_proj);
+                    best_seq = self.decode_seq(_decode_inv_proj.flatten().numpy())
+
         for i in range(n_iters):
 
             # fit and get the GP model
             self.gp = self.get_fitted_gp_model(train_X, train_Y)
             # self.UCB = UpperConfidenceBound(self.gp, beta=0.1)
-            self.acq_func = ExpectedImprovement(self.gp, best_score)
+            # self.acq_func = ExpectedImprovement(self.gp, best_score)
+            self.acq_func = LogExpectedImprovement(self.gp, best_score)
 
             # grab candidate(s)
-            candidate, acq_value = optimize_acqf(
-                self.acq_func, bounds=self.bounds, q=1, num_restarts=5, raw_samples=20,
+            # q x d if return_best_only is True (default) – num_restarts x q x d if return_best_only is False
+            if self.normalize_data:
+                _bounds = self.standard_bounds
+            else:
+                _bounds = self.bounds
+
+            candidates, acq_values = optimize_acqf(
+                self.acq_func, bounds=_bounds, q=1, num_restarts=n_restarts, raw_samples=20,
+                return_best_only=False
             )
 
+            if self.normalize_data:
+                candidates = unnormalize(candidates.detach(), bounds=self.bounds)
+            
             # inverse projection
-            candidate_invproj = self.dimensionality_reducer.inverse_transform(candidate)
-            candidate_invproj = torch.from_numpy(candidate_invproj)
+            candidates_invproj = self.dimensionality_reducer.inverse_transform(candidates)
+            if verbose:
+                print(f"candidate in reduced space: {candidates}")
+                print(f"candidate in original space: {candidates_invproj}")
 
+            if isinstance(candidates_invproj, np.ndarray):
+                candidates_invproj = torch.from_numpy(candidates_invproj)
+
+            candidates_invproj = candidates_invproj.reshape(-1, candidates_invproj.shape[-1]) # (n_restarts, 1, d_latent) -> (n_restarts, d_latent)
             # decode the candidate sequence from the latent space to the original sequence space
             with torch.no_grad():
-                candidate_decoded = self.generative_model.greedy_decode(candidate_invproj)
+                if self.params.get("use_esm", False):
+                    _decode_inv_proj = self.generative_model.greedy_decode(candidates_invproj)
+                    candidate_decoded = _decode_inv_proj # ESM has its own decoding method
+                else:
+                    candidate_decoded = self.generative_model.greedy_decode(candidates_invproj);
+            
+            if self.params.get("use_esm", False):
+                candidate_sequences = candidate_decoded
+            else:
+                candidate_sequences = []
+                for j in range(candidate_decoded.shape[0]):
+                    candidate_sequences.append(self.decode_seq(candidate_decoded[j].flatten().numpy()))
 
-            candidate_sequence = self.decode_seq(candidate_decoded.flatten().numpy())
-
-            print(f"candiate sequence: {candidate_sequence}")
-            prediction_score = self.property_oracle.predict(
-                [candidate_sequence]
+            if verbose:
+                print(f"candiate sequences: {candidate_sequences}")
+            
+            prediction_scores = self.property_oracle.predict(
+                candidate_sequences
             )
+            
+            candidate          = candidates[         acq_values.argmax()]
+            candidate_sequence = candidate_sequences[acq_values.argmax()]
+
+            if prediction_scores is None: 
+                prediction_score = None
+            else:
+                prediction_score   = prediction_scores[  acq_values.argmax()]
+
+            # if all([i is None for i in prediction_scores]):
+            #     prediction_score = None
+
+            if   isinstance(prediction_score, torch.Tensor):
+                prediction_score = prediction_scores.item()
+            elif isinstance(prediction_score, np.ndarray):
+                prediction_score = prediction_scores[0]
+            elif isinstance(prediction_score, list):
+                prediction_score = prediction_scores[0]
 
             if self.minimize_or_maximize_score=="minimize":
+                if prediction_score is None:
+                    prediction_score = 3.5 # for MIC and HC50, the log values range between, -1.5 to 3.5. so 3.5 is a reasonable upper bound
                 objective_value = -prediction_score
             else:
+                if prediction_score is None:
+                    prediction_score = -3.5
                 objective_value =  prediction_score
 
             # update the training data for the GP model
             train_X = torch.cat([train_X, candidate], dim=0)
-            train_Y = torch.cat([train_Y, torch.tensor(prediction_score).float().reshape(1,1)], dim=0)
+            # train_Y = torch.cat([train_Y, torch.tensor(prediction_score).float().reshape(1,1)], dim=0)
+            train_Y = torch.cat([train_Y, torch.tensor(objective_value).float().reshape(1,1)], dim=0)
             if objective_value > best_score:
                 best_score = objective_value
                 best_seq   = candidate_sequence
             
-            print(f"iteration {i+1} completed. Prediction score: {prediction_score}")
+
+
+            print(f"iteration {i+1} completed. Prediction score: {prediction_score}. Best score: {best_score}")
             self.optimization_results["iterations"].append(i+1+last_iteration)
             self.optimization_results["candidates"].append(candidate_sequence)
             self.optimization_results["candidate_scores"].append(prediction_score)
-            self.optimization_results["best_objective_value"] = best_score
-            self.optimization_results["best_sequence"] = best_seq
+            self.optimization_results["best_objective_values"].append(best_score)
+            self.optimization_results["best_sequences"].append(best_seq)
+
+            if i%100==0:
+                _run = self.params.get("run", "default")
+                #_name = self.params.get("chkpt_fpath", "default").split('/')[1]
+                _name = self.params.get("model_name", "default")
+                _output_dir = self.params.get("output_dir", "./")
+                if _output_dir[-1]!="/":
+                    _output_dir+="/"
+                try:
+
+                    N_INITALIZATION_POINTS = self.params['n_initialization_points'] 
+                    if N_INITALIZATION_POINTS!=100:
+                        boloop_dir_suffix =f"_{N_INITALIZATION_POINTS}_init_points"
+                    else:
+                        boloop_dir_suffix =""
+
+                    os.makedirs(_output_dir+f"boloop_results{boloop_dir_suffix}/")
+                except FileExistsError:
+                    pass
+
+                if self.bounds_int==5:
+                    _bounds_term =""
+                else:
+                    _bounds_term = f"_neg{self.bounds_int}to{self.bounds_int}_"
+
+                if self.params["n_pca_components"]!=5:
+                    _pca_dims_term = f"_PCAdims{self.params['n_pca_components']}_"
+                else:
+                    _pca_dims_term = "_"
+
+                with open(f"{_output_dir}boloop_results{boloop_dir_suffix}/optimization_results_{self.params['dimensionality_reduction_method']}{_pca_dims_term}{_bounds_term}{_name}_run{_run}.pkl", "wb") as f:
+                    pkl.dump(self.optimization_results, f)
+                #with open(f"{_output_dir}boloop_results/optimization_results_{_name}_run{_run}.pkl", "wb") as f:
+                #    pkl.dump(self.optimization_results, f)
 
         print("Optimization complete")
 

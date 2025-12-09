@@ -49,8 +49,14 @@ def DDP_init(self):
     """ this block initializes a process group and initiate communications
         between all processes running on all nodes """
     #print('From Rank: {}, ==> Initializing Process Group...'.format(rank))
-    os.system("echo From Rank: {}, ==> Initializing Process Group...".format(rank))
+    os.system("os.system:echo From Rank: {}, ==> Initializing Process Group...".format(rank))
     print("echo From Rank: {}, ==> Initializing Process Group...".format(rank))
+    print(f"echo rank={rank},local_rank={local_rank},ngpus_per_node={ngpus_per_node},current_device={current_device}")
+    print(f"backend={self.params['DIST_BACKEND']},init_method={self.params['INIT_METHOD']},world_size={self.params['WORLD_SIZE']}")
+    print("SLURM_LOCALID:", os.environ.get("SLURM_LOCALID"))
+    print("SLURM_NODEID:", os.environ.get("SLURM_NODEID"))
+    print("MASTER_ADDR:", os.environ.get("MASTER_ADDR"))
+    print("MASTER_PORT:", os.environ.get("MASTER_PORT"))
     #init the process group
     dist.init_process_group(backend=self.params['DIST_BACKEND'], init_method=self.params['INIT_METHOD'],
                             world_size=self.params['WORLD_SIZE'], rank=rank)
@@ -66,4 +72,12 @@ def DDP_init(self):
 
     self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[current_device])
     print('passed distributed data parallel call')
-         
+
+
+def reduce_tensor(tensor):
+    rt = tensor.clone().detach()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    rt /= (
+        torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    )
+    return rt

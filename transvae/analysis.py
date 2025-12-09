@@ -3,10 +3,10 @@ import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+import pickle as pkl
 
 from transvae.tvae_util import KLAnnealer
-
+from scipy.stats import pearsonr
 # Plotting functions
 
 def plot_test_train_curves(paths, target_path=None, loss_type='tot_loss', data_type='test', labels=None, colors=None):
@@ -215,3 +215,191 @@ def get_json_data(dir, fns=None, labels=None):
             dump = json.load(f)
         data[label] = dump
     return data, labels
+
+
+def make_model_name(_prop, model_number, semi_sup_percent):
+    
+    if   _prop == "bch":
+        prop="bch"
+    elif _prop == "bc":
+        prop="boman-chargepH7p2"
+    elif _prop == "b":
+        prop="boman"
+    elif _prop == "c":
+        prop="chargepH7p2"
+    elif _prop == "h":
+        prop="hydrophobicity"
+    elif _prop in ["predicted-log10mic", "oracle"]:
+        prop = "predicted-log10mic"
+    
+    if (semi_sup_percent==100 or semi_sup_percent=="100"):
+        percent = ""
+        suffix="dPP64-ZScore"
+    elif (semi_sup_percent==0 or semi_sup_percent=="0"):
+        if prop=="predicted-log10mic":
+            percent = "0-"
+        else:
+            percent = ""
+        suffix="cdhit90-zScoreNormalized"
+    else:
+        percent = str(semi_sup_percent)+"-"
+        suffix="cdhit90-zScoreNormalized"
+
+    model_name=f"transvae-64-peptides-{prop}-zScoreNormalized-{percent}organized-{suffix}"
+
+    return model_name
+
+def get_latent_spaces():
+    mu_embedding_files = []
+    data_dir = "analysis/"
+    file_to_grab_prefix = "mu_transvae-64"
+    file_to_grab_suffix = "train.npy"
+    
+    for _prop in ['boman', 'hydrophobicity', 'chargepH7p2', 'boman-chargepH7p2', 'bch', "predicted-log10mic"]:
+        percentages = [0,25,50,75, 98]
+        if _prop=="predicted-log10mic":
+            percentages = [0, 98]
+        for _perc in percentages:
+            
+            for _d in os.listdir(data_dir):
+                
+                
+                condn_dir = (os.path.isdir(data_dir+_d))
+                if _perc==0:
+                    if _prop=="predicted-log10mic":
+                        condn_prefix = (_d.startswith(f"transvae-64-peptides-{_prop}-zScoreNormalized-0-org"))
+                    else:
+                        condn_prefix = (_d.startswith(f"transvae-64-peptides-{_prop}-zScoreNormalized-org"))
+                else:
+                    condn_prefix = (_d.startswith(f"transvae-64-peptides-{_prop}-zScoreNormalized-{_perc}"))
+                condn_suffix = (_d.endswith("organized-cdhit90-zScoreNormalized") )
+                condn_not = ("--" not in _d)
+                
+                if condn_dir and condn_prefix and condn_suffix and condn_not:
+                    print(f"{_d=}")
+                    for _f in os.listdir(data_dir+_d):
+                        if _f.startswith(file_to_grab_prefix) and _f.endswith(file_to_grab_suffix):
+                            print(f"{_f=}")
+                            mu_embedding_files.append(os.path.join(_d, _f) )
+                    print()
+    
+    latent_spaces = {}
+    file_to_grab_prefix = "mu_transvae-64"
+    file_to_grab_suffix = "train.npy"
+    
+    for _prop in ['boman', 'hydrophobicity', 'chargepH7p2', 'boman-chargepH7p2', 'bch', "predicted-log10mic"]:
+        percentages = [0,25,50,75, 98]
+        if _prop=="predicted-log10mic":
+            percentages = [0, 98]
+            
+        for _perc in percentages:
+            for _dir_file in mu_embedding_files:
+                _d, _f = _dir_file.split("/")
+                if _perc==0:
+                    if _prop=="predicted-log10mic":
+                        if _d.endswith("zScoreNormalized-0-organized-cdhit90-zScoreNormalized") and (f"peptides-{_prop}-z" in _d ):
+                                print(_d)
+                                latent_spaces[_prop+"-"+str(_perc)] = np.load(os.path.join(data_dir,_dir_file) )
+                    else:
+                        if _d.endswith("zScoreNormalized-organized-cdhit90-zScoreNormalized") and (f"peptides-{_prop}-z" in _d ):
+                            print(_d)
+                            latent_spaces[_prop+"-"+str(_perc)] = np.load(os.path.join(data_dir,_dir_file))
+                else:
+                    if (_prop+"-zS" in _d) and (f"-{_perc}-org" in _d):
+                        
+                        latent_spaces[_prop+"-"+str(_perc)] = np.load(os.path.join(data_dir,_dir_file))
+    
+    return latent_spaces
+
+
+def get_boloop_runs(model_name, perc, dim_reduction_method, box_bounds, n_pca_dims=5):
+
+    if box_bounds==10:
+        box_bound_info = f"_neg{box_bounds}to{box_bounds}_"
+    else:
+        box_bound_info = ""
+
+    if n_pca_dims==5:
+        pca_dim_info = ""
+    else:
+        pca_dim_info = f"_PCAdims{n_pca_dims}_"
+    
+    if (perc==0 or perc=="0") and ("predicted-log10mic" not in model_name):
+        _fname = f"boloop_results_{dim_reduction_method}{box_bound_info}{pca_dim_info}{model_name}_log10_mic.pkl"
+        print("in first if")
+        print(f"{_fname=}")
+        
+        with open(f"analysis/{model_name}/boloop_results/{_fname}", 'rb') as f:
+            data=pkl.load(f)
+        
+        runs = [data[f'run_{j}'] for j in range(5)]
+    else:
+        # check if boloop_results file exists first
+        _fname = f"boloop_results_{dim_reduction_method}{box_bound_info}{pca_dim_info}{model_name}_log10_mic.pkl"
+        print(f"{_fname=}")
+        if os.path.exists(f"analysis/{model_name}/boloop_results/{_fname}"):
+            with open(f"analysis/{model_name}/boloop_results/{_fname}", 'rb') as f:
+                data=pkl.load(f)
+            
+            runs = [data[f'run_{j}'] for j in range(5)]        
+        else:
+            print("boloop results file doesn't exist?")
+            runs = []
+            for i in range(5):
+                if "predicted-log10mic" in model_name:                    
+                    _fname = f"optimization_results_{model_name}_run{i}.pkl"
+                else:
+                    _fname = f"optimization_results_{dim_reduction_method}{box_bound_info}{model_name}_run{i}.pkl"
+                print(f"{_fname=}")
+                _fpath = f"analysis/{model_name}/boloop_results/{_fname}"
+                if os.path.exists(_fpath):
+                    with open(_fpath, "rb") as f:
+                        _run=pkl.load(f)
+                elif dim_reduction_method=="PCA":
+                    _fname = f"optimization_results_{model_name}_run{i}.pkl"
+                    print(f"trying filename: {_fname}")
+                    _fpath = f"analysis/{model_name}/boloop_results/{_fname}"
+                    with open(_fpath, "rb") as f:
+                        _run=pkl.load(f)
+                        
+                runs.append( _run )
+    
+    return runs
+
+#
+def get_top_2_most_correlated_PCs(df, property_col, return_pcs=True):
+    """
+    Computes the pearson correlation coefficient (PCC) between principal components 
+    and the desired property (property_col). Returns the top two, or returns all
+    with their PCCs
+
+    Parameters:
+    ----------
+    df: pd.DataFrame
+        the data. Columns like: [pc1, pc2, pc3, ..., pcn, property_col]
+
+    property_col: str
+        The column name in the df for the property we compute correlation with.
+
+    Returns:
+    --------
+        Top two principal components,
+        OR
+        A sorted list of tuples (pci, pcci), the principal component and its 
+        corresponding correlation value. 
+    """
+    
+    _prop_values = df[property_col].values
+
+    pcs_and_corrs = []
+    for _col in df.columns:
+        if _col.startswith("pc"):
+            correl = pearsonr(df[_col].values, _prop_values)
+            pcs_and_corrs.append( (_col, abs(correl.statistic)) )
+
+    pcs_and_corrs = sorted(pcs_and_corrs, key= lambda x: x[1], reverse=True)
+
+    if return_pcs:
+        return pcs_and_corrs[0][0], pcs_and_corrs[1][0] 
+    else:
+        return pcs_and_corrs

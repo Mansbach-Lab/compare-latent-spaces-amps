@@ -52,23 +52,56 @@ def vae_loss(x, x_out, mu, logvar, true_prop, pred_prop, weights, self, beta=1):
         KLD = torch.tensor(0.)
     return BCE + KLD + bce_prop, BCE, KLD, bce_prop
 
-def trans_vae_loss(x, x_out, mu, logvar, true_len, pred_len, true_prop, pred_prop, weights, self, beta=1):
+def trans_vae_loss(x, x_out, mu, logvar, true_len, pred_len, true_prop, pred_prop, weights, self, beta=1,beta_property=1):
     "Binary Cross Entropy Loss + Kullbach leibler Divergence + Mask Length Prediction"
+    batch_size, _ = x.size()
     x = x.long()[:,1:] - 1
     x = x.contiguous().view(-1)
     x_out = x_out.contiguous().view(-1, x_out.size(2))
     true_len = true_len.contiguous().view(-1)
-    BCEmol = F.cross_entropy(x_out, x, reduction='mean', weight=weights)
+    BCEmol  = F.cross_entropy(x_out, x,           reduction='mean', weight=weights)
     BCEmask = F.cross_entropy(pred_len, true_len, reduction='mean')
     KLD = beta * -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    # KLD = beta * -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch_size
     if pred_prop is not None:
         if "decision_tree" in self.params["type_pp"]:
             print(pred_prop)
         else: 
+            # check prediction types. 
+            # when None, assume binary classification
+            # when not None, loop through each prediction type
+            if (self.params["prediction_types"] is None):
+                bce_prop = F.binary_cross_entropy(
+                    pred_prop.squeeze(-1)[~torch.isnan(true_prop)], 
+                    true_prop[            ~torch.isnan(true_prop)]
+                )
+            else:
+                _nan_encountered = False
+                prop_losses = []
+                for i in range(pred_prop.shape[1]):
+                    if self.params["prediction_types"][i] == "classification":
+                        _prop_loss = F.cross_entropy(
+                            pred_prop[:,i][~torch.isnan(true_prop[:,i])], 
+                            true_prop[:,i][~torch.isnan(true_prop[:,i])]
+                        )
+                    else:
+                        _prop_loss = F.mse_loss(
+                            pred_prop[:,i][~torch.isnan(true_prop[:,i])], 
+                            true_prop[:,i][~torch.isnan(true_prop[:,i])]
+                        )
+                    
+                    if len( true_prop[:,i][~torch.isnan(true_prop[:,i])] ) == 0:
+                        prop_losses.append( torch.tensor(0.) )        
+                    else:
+                        prop_losses.append( _prop_loss )
+                bce_prop = torch.sum(torch.stack(prop_losses))
+            
+            bce_prop = beta_property * bce_prop
             #bce_prop = F.binary_cross_entropy(pred_prop.squeeze(-1), true_prop)
-            bce_prop = F.cross_entropy(pred_prop.squeeze(-1), true_prop)
+            # bce_prop = F.cross_entropy(pred_prop.squeeze(-1), true_prop)
     else:
         bce_prop = torch.tensor(0.)
+        
     if torch.isnan(KLD):
         KLD = torch.tensor(0.)
     return BCEmol + BCEmask + KLD + bce_prop, BCEmol, BCEmask, KLD, bce_prop
@@ -188,7 +221,7 @@ def im_kernel_sum(z1, z2, z_var, exclude_diag=True):
 
     return kernel_sum
 
-def deep_rmsd_isometry_loss(mu, x_structures, beta=1):
+def deep_isometry_loss(mu, sequences, pairwise_distances, beta=None, reduction='mean'):
     """
     Deep Isometry Loss. 
     Computes the difference in distance b/w latent space points 
@@ -198,54 +231,56 @@ def deep_rmsd_isometry_loss(mu, x_structures, beta=1):
     ----------
         mu : torch.tensor
              latent space points
-        x_structures : list
-                       list of inputted structures
+        target_distances : torch.tensor 
+                desired distances between latent space points
 
     Returns:
     -------
         loss : torch.tensor
                difference in distance b/w latent space points 
-               and their corresponding inputted points' aligned rmsds
+               and their corresponding target distance
     """
+    _n = len(mu)
+    target_distances = torch.zeros((_n*(_n-1))//2, dtype=torch.float32)
+    _dist_idx = 0
+    for i in range(len(sequences)):
+        for j in range(i+1, len(sequences)):
+            target_distances[_dist_idx] = pairwise_distances.get(sequences[i]+"_"+sequences[j],-1)
+            _dist_idx += 1
 
     # compute pairwise distances in the latent space using mu_subset
     # https://pytorch.org/docs/stable/generated/torch.cdist.html
-    n = len(mu)
-    _pairwise_distances = torch.zeros((n*(n-1))//2, dtype=torch.float32)
-    idx = 0
-    for i in range(n):
-        for j in range(i+1, n):
-            _pairwise_distances[idx] = torch.dist(mu[i], mu[j], p=2)
-            idx += 1
-                                
-    # _pairwise_distances = torch.cdist(mu, mu, p=2)
-    # _flattened = []
-    # for i in range(len(mu)):
-    #     for j in range(i+1,len(mu)):
-    #         _flattened.append(_pairwise_distances[i,j])
-    # print("making pairwise distance tensor")
-    # _pairwise_distances = torch.tensor(_flattened).flatten()
+    logging.info("computing pairwise distances between latent space points")
+    _n = len(mu)
+    _mu_pairwise_distances = torch.zeros((_n*(_n-1))//2, dtype=torch.float32)
+    _mu_idx = 0
+    for i in range(_n):
+        for j in range(i+1, _n):
+            _mu_pairwise_distances[_mu_idx] = torch.dist(mu[i], mu[j], p=2)
+            _mu_idx += 1
 
-    # compute pairwise rmsds between the structures
-    _rmsds = biostructure_to_rmsds(x_structures)
-    if len(_rmsds) == 1:
-        if _rmsds < 0: # then error
-            return torch.tensor(0.)
-    logging.info("making rmsd tensor")
-    _rmsds = torch.from_numpy(_rmsds).flatten()
+    if len(target_distances)!=len(_mu_pairwise_distances):
+        raise ValueError(f"Number of pairwise distances ({len(_mu_pairwise_distances)}) and target distances ({len(target_distances)}) do not match")
 
-    if len(_rmsds)!=len(_pairwise_distances):
-        raise ValueError(f"Number of pairwise distances ({len(_pairwise_distances)}) and rmsds ({len(_rmsds)}) do not match")
+    # ignore indices where target_distances = -1
+    _mu_pairwise_distances = _mu_pairwise_distances[target_distances!=-1]
+    target_distances = target_distances[target_distances!=-1]
 
-    # ignore indices where RMSD = -1
-    _pairwise_distances = _pairwise_distances[_rmsds!=-1]
-    _rmsds = _rmsds[_rmsds!=-1]
+    logging.info(f"Number of pairwise distances: {_mu_pairwise_distances.shape[0]}")
+    if _mu_pairwise_distances.shape[0] > 0:
+        logging.info(f"min, max pairwise distances: {_mu_pairwise_distances.min()}, {_mu_pairwise_distances.max()}")
 
     # compute difference between pairwise distances and rmsds
-    _diff  = torch.abs(_pairwise_distances - _rmsds)
-    loss   = torch.mean(_diff)
+    _diff  = torch.pow(_mu_pairwise_distances - target_distances,2) # basically |d(z_i, z_j) - d(x_i, x_j)|
+    if reduction == 'mean':
+        loss = torch.mean(_diff)
+    else:
+        loss = _diff
 
-    return loss
+    if beta is None:
+        return loss
+    else:
+        return beta*loss
 
 def triplet_loss():
     pass

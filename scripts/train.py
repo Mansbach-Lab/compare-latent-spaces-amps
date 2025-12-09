@@ -1,3 +1,5 @@
+from comet_ml import Experiment, ExistingExperiment
+
 import os
 import pickle
 import pkg_resources
@@ -14,7 +16,7 @@ from transvae.rnn_models import RNN, RNNAttn
 from transvae.structure_prediction import StructurePredictor
 from scripts.parsers import model_init, train_parser
 
-def train(args):
+def train(args, comet_experiment=None):
     ### Update beta init parameter from loaded chekpoint
     if args.checkpoint is not None:
         ckpt = torch.load(args.checkpoint, map_location=torch.device('cuda'))
@@ -31,6 +33,17 @@ def train(args):
         args.property_predictor= True
     else: 
         args.property_predictor = False
+    
+    if args.hardware == 'gpu':
+        if args.DDP is False:
+            print("changed visible devices to ", args.device_id)
+            os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.device_id)
+
+            # check visible devices
+            print("visible devices: ", os.environ["CUDA_VISIBLE_DEVICES"])
+            print("device count: ", torch.cuda.device_count())
+            for i in range(torch.cuda.device_count()):
+                print(f"device {i} (pytorch device idx) name: ", torch.cuda.get_device_name(i))
     
     ### Build params dict from the parsed arguments
     params = {'ADAM_LR': args.adam_lr,
@@ -52,7 +65,9 @@ def train(args):
               'DISCRIMINATOR_LAYERS' : args.discriminator_layers,
               'LOSS_METHOD': args.loss_method,
               'd_pp_out': args.d_pp_out,
-              'prediction_types': args.prediction_types,          
+              'prediction_types': args.prediction_types,
+              'save_dir': args.save_dir,
+              "mask_label_percent": args.mask_label_percent,
     }
 
     ### Load data, vocab and token weights
@@ -74,6 +89,52 @@ def train(args):
     else:
         train_props = None
         test_props  = None
+        params['d_pp_out'] = 1 # default value for d_pp_out if not training a property predictor
+        args.d_pp_out = 1
+
+    if "yes" in args.use_isometry_loss:
+        use_isometry_loss = True
+    else:
+        use_isometry_loss = False
+
+    if use_isometry_loss:
+        logging.info("Using isometry/contrastive loss")
+        pairwise_distances = None
+        inputs_w_distances = None
+        # when true, using contrastive loss defined in as outlined in trans_models.py
+
+        # logging.info(f"Loading precomputed pairwise distances from {args.pairwise_distances}")
+        # grab target distances ('labels')
+        
+        ### commented out because we are not using the pairwise distances
+        # assert args.pairwise_distances is not None, "ERROR: Must specify path to precomputed pairwise distances if using isometry loss"
+        # if args.pairwise_distances is not None:
+        #     if args.pairwise_distances.endswith('.pkl'):
+        #         logging.info('Loading precomputed pairwise distances from {}'.format(args.pairwise_distances))
+        #         with open(args.pairwise_distances, 'rb') as f:
+        #             pairwise_distances = pickle.load(f)
+                    # don't need to split into train/test because values
+                    # are accessed by seqi_seqj pairs.
+                    # seqi, seqj are sampled from the same set
+        
+        # also grab subset of inputs that have pairwise distances
+        # (i.e. the subset of inputs that were used to compute the distances)
+        # in our peptide case only 1% of the data has corresponding pairwise distances
+        # assert args.train_inputs_w_distances is not None, "ERROR: Must specify path to training inputs with pairwise distances if using isometry loss"
+        # if args.train_inputs_w_distances is not None:
+        #     logging.info('Loading train inputs with pairwise distances from {}'.format(args.train_inputs_w_distances))
+        #     train_inputs_w_distances = pd.read_csv(args.train_inputs_w_distances) 
+        
+        # assert args.test_inputs_w_distances is not None, "ERROR: Must specify path to testing inputs with pairwise distances if using isometry loss"
+        # if args.test_inputs_w_distances is not None:
+        #     logging.info('Loading test inputs with pairwise distances from {}'.format(args.test_inputs_w_distances))
+        #     test_inputs_w_distances = pd.read_csv(args.test_inputs_w_distances)
+        # inputs_w_distances = (train_inputs_w_distances, test_inputs_w_distances)
+    else:
+        pairwise_distances = None
+        inputs_w_distances = None
+
+    # Load char_dict and char_weights
     with open('data/char_dict_{}.pkl'.format(args.data_source), 'rb') as f:
         char_dict = pickle.load(f)
     char_weights = np.load('data/char_weights_{}.npy'.format(args.data_source))
@@ -89,29 +150,21 @@ def train(args):
     params['CHAR_DICT'] = char_dict
     params[ 'ORG_DICT'] =  org_dict
 
-    ### if using structure loss, load structure predictor
-    # args.structure_model_path
-    # args.structure_loss
-    if "yes" in args.use_structure_loss:
-        print(f"Using structure model from {args.structure_model_path}")
-        if args.hardware == "gpu":
-            esmfold = StructurePredictor(args.structure_model_path, device="gpu")
-        else:
-            esmfold = StructurePredictor(args.structure_model_path)
-        use_structure_loss = True
-    else:
-        esmfold = None
-        use_structure_loss = False
-
     ####################
     ### Train model
     ####################
+    logging.info("Initializing model")
     vae = model_init(args, params)
     if args.checkpoint is not None:
         vae.load(args.checkpoint)
+    esmfold=None # DEPRECATED on this branch
+    logging.info("Training model...")
     vae.train(train_mols, test_mols, train_props, test_props,
               epochs=args.epochs, save_freq=args.save_freq,
-              use_structure_loss=use_structure_loss, structure_predictor=esmfold
+              use_contrastive_loss=use_isometry_loss, 
+              pairwise_distances=pairwise_distances, 
+              inputs_w_distances=inputs_w_distances, 
+              comet_experiment=comet_experiment
     )
 
 
@@ -120,9 +173,28 @@ if __name__ == '__main__':
     parser = train_parser()
     args = parser.parse_args()
 
+    if args.comet == "ON":
+        if (args.comet_experiment_key is not None):
+            if (len(args.comet_experiment_key) > 0):
+                experiment = ExistingExperiment(api_key=args.comet_api_key, 
+                                                previous_experiment=args.comet_experiment_key
+                                        )
+            else:
+                experiment = Experiment(api_key=args.comet_api_key, 
+                                        project_name=args.comet_project_name
+                )
+        else:
+            experiment = Experiment(api_key=args.comet_api_key, 
+                                    project_name=args.comet_project_name
+            )
+        experiment.log_parameters(vars(args))
+    else:
+        experiment = None
+
+    logfilename = args.logfile
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s',
-                        filename="train.log")
+                        filename=args.logfile)
     
     # quick fix of parser bug. parsing prediction_types as a list of strings rather than a list of characters
     if args.prediction_types is not None:
@@ -135,4 +207,10 @@ if __name__ == '__main__':
         else:
             raise ValueError("prediction_types must be a list of strings or a list of lists of characters")
         args.prediction_types = fixed_prediction_types
-    train(args)
+
+    if args.mask_label_percent is not None:
+        args.mask_label_percent = float(args.mask_label_percent/100)
+        print(f"{args.mask_label_percent=}")
+
+    print(f"{fixed_prediction_types=}")
+    train(args, comet_experiment=experiment)

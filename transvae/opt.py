@@ -37,6 +37,8 @@ class NoamOpt:
 
     def load_state_dict(self, state_dict):
         self.optimizer.load_state_dict(state_dict)
+        self.state_dict['step'] = state_dict['step']
+        self.state_dict['rate'] = state_dict['rate']
 
 class AdamOpt:
     "Adam optimizer wrapper"

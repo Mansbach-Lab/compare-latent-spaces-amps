@@ -100,7 +100,7 @@ class TransVAE(VAEShell):
         generator = Generator(self.params['d_model'], self.vocab_size)
         if self.params['property_predictor']:
             property_predictor = PropertyPredictor(self.params['d_pp'], self.params['depth_pp'], self.params['d_latent'],
-                                                   self.params['type_pp'])
+                                                   self.params['type_pp'], self.params["d_pp_out"], self.params["prediction_types"])
         else:
             property_predictor = None
         self.model = EncoderDecoder(encoder, decoder, src_embed, tgt_embed, generator, property_predictor)
@@ -255,7 +255,7 @@ class VAEDecoder(nn.Module):
     def forward(self, x, mem, src_mask, tgt_mask):
         ### Deconvolutional bottleneck (up-sampling)
         if not self.bypass_bottleneck:
-            mem = F.relu(self.linear(mem))
+            mem = F.leaky_relu(self.linear(mem))
             mem = mem.view(-1, 64, self.conv_out)
             mem = self.deconv_bottleneck(mem)
             mem = mem.permute(0, 2, 1)
@@ -272,7 +272,7 @@ class VAEDecoder(nn.Module):
     def forward_w_attn(self, x, mem, src_mask, tgt_mask):
         "Forward pass that saves attention weights"
         if not self.bypass_bottleneck:
-            mem = F.relu(self.linear(mem))
+            mem = F.leaky_relu(self.linear(mem))
             mem = mem.view(-1, 64, self.conv_out)
             mem = self.deconv_bottleneck(mem)
             mem = mem.permute(0, 2, 1)
@@ -355,4 +355,4 @@ class PositionwiseFeedForward(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.w_2(self.dropout(F.relu(self.w_1(x))))
+        return self.w_2(self.dropout(F.leaky_relu(self.w_1(x))))

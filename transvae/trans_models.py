@@ -1,5 +1,9 @@
+import comet_ml
+
 import os
 import json
+import sys
+import logging
 from time import perf_counter
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,7 +16,10 @@ from torch.autograd import Variable
 from transvae.tvae_util import *
 from transvae.opt import NoamOpt
 from transvae.data import vae_data_gen, make_std_mask
-from transvae.loss import vae_loss, trans_vae_loss, aae_loss, wae_loss, deep_rmsd_isometry_loss
+from transvae.loss import vae_loss, trans_vae_loss, aae_loss, wae_loss, deep_isometry_loss
+from transvae.DDP import reduce_tensor
+
+from pytorch_metric_learning import losses as ptlosses
 
 import torch.distributed as dist
 import torch.utils.data.distributed
@@ -84,8 +91,8 @@ class VAEShell():
             os.system("cp {} ~/scratch".format(save_path))
         else:
             torch.save(state, save_path)
-        
-        
+
+        # also save beta annealer state
         
     def load(self, checkpoint_path, rank=0, workaround=None):
         """
@@ -114,10 +121,10 @@ class VAEShell():
                 self.current_state[k] = None
 
         self.vocab_size = len(self.current_state['params']['CHAR_DICT'].keys())
-        self.pad_idx = self.current_state['params']['CHAR_DICT']['_']
-        state_dict = self.current_state['model_state_dict']
-        self.name = self.current_state['name']
-        self.n_epochs = self.current_state['epoch']
+        self.pad_idx   = self.current_state['params']['CHAR_DICT']['_']
+        state_dict     = self.current_state['model_state_dict']
+        self.name      = self.current_state['name']
+        self.n_epochs  = self.current_state['epoch']
         self.best_loss = self.current_state['best_loss']
         #This is the last key in the outer dict. Need to match the values from the ckpt.
         for k, v in self.current_state['params'].items():
@@ -144,8 +151,8 @@ class VAEShell():
             self.optimizer.load_state_dict(self.current_state['optimizer_state_dict'])
             
     def train(self, train_mols, val_mols, train_props=None, val_props=None,
-              epochs=200, use_structure_loss=False, structure_predictor=None,
-              save=True, save_freq=None, log=True, log_dir='trials'):
+              epochs=200, use_contrastive_loss=False, pairwise_distances=None, inputs_w_distances=None,
+              save=True, save_freq=None, log=True, log_dir='trials', comet_experiment=None):
         """
         Train model and validate
 
@@ -163,31 +170,53 @@ class VAEShell():
             save_freq (int): Frequency with which to save model checkpoints
             log (bool): If true, writes training metrics to log file
             log_dir (str): Directory to store log files
+            use_contrastive_loss: (bool) If true, uses contrastive loss,
+
+        Notes:
+        - use_contrastive_loss, the arguments being provided to it are call use_isometry_loss due to historical testing of an isometry loss method.
         """
         torch.backends.cudnn.benchmark = True #optimize run-time for fixed model input size
-        
+        structure_predictor = None # DEPRECATED
         ### Prepare data iterators
-        train_data = vae_data_gen(train_mols, self.src_len, self.name, train_props, char_dict=self.params['CHAR_DICT'])
-        val_data   = vae_data_gen(  val_mols, self.src_len, self.name,   val_props, char_dict=self.params['CHAR_DICT'])
+        train_data, binners = vae_data_gen(train_mols, self.src_len, self.name, train_props, 
+                                  char_dict=self.params['CHAR_DICT'], 
+                                  mask_label_percent=self.params['mask_label_percent'], use_contrastive_loss=use_contrastive_loss
+        )
+        val_data, _   = vae_data_gen(  val_mols, self.src_len, self.name,   val_props, 
+                                  char_dict=self.params['CHAR_DICT'], 
+                                  mask_label_percent=self.params['mask_label_percent'],
+                                  binners=binners, use_contrastive_loss=use_contrastive_loss
+                                  )
+        ### DELETE ME
         
+
+        
+        # special input for isometry learning
+        use_isometry_loss=False
+        if use_isometry_loss:
+            logging.info(f"generating encoded sequences for isometry loss")
+            assert inputs_w_distances is not None, "ERROR: Must provide inputs with distances"
+            train_data_w_distances = vae_data_gen(inputs_w_distances[0].values, self.src_len, self.name, None, char_dict=self.params['CHAR_DICT'])
+            val_data_w_distances   = vae_data_gen(inputs_w_distances[1].values, self.src_len, self.name, None, char_dict=self.params['CHAR_DICT'])
+
         #SPECIAL DATA INPUT FOR DDP
         if self.params['DDP']:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True)
-            val_sampler = torch.utils.data.distributed.DistributedSampler(val_data, shuffle=True)
-            train_iter = torch.utils.data.DataLoader(train_data,
+            train_sampler   = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True)
+            val_sampler     = torch.utils.data.distributed.DistributedSampler(  val_data, shuffle=True)
+            train_iter  = torch.utils.data.DataLoader(train_data,
                                                 batch_size=self.params['BATCH_SIZE'],
                                                 num_workers=0,
                                                 pin_memory=False, drop_last=True, sampler=train_sampler)
-            val_iter = torch.utils.data.DataLoader(val_data,
+            val_iter    = torch.utils.data.DataLoader(val_data,
                                                 batch_size=self.params['BATCH_SIZE'],
                                                 num_workers=0,
                                                 pin_memory=False, drop_last=True, sampler=val_sampler)
         else:
-            train_iter = torch.utils.data.DataLoader(train_data,
+            train_iter  = torch.utils.data.DataLoader(train_data,
                                                  batch_size=self.params['BATCH_SIZE'],
                                                  shuffle=True, num_workers=0,
                                                  pin_memory=False, drop_last=True)
-            val_iter = torch.utils.data.DataLoader(val_data,
+            val_iter    = torch.utils.data.DataLoader(val_data,
                                                batch_size=self.params['BATCH_SIZE'],
                                                shuffle=True, num_workers=0,
                                                pin_memory=False, drop_last=True)
@@ -215,12 +244,31 @@ class VAEShell():
             log_file = open(log_fn, 'a')
             if not already_wrote:
                 log_file.write('epoch,batch_idx,data_type,tot_loss,recon_loss,pred_loss,'\
-                               'kld_loss,prop_bce_loss,disc_loss,mmd_loss,rmsd_loss,run_time\n')
+                               'kld_loss,prop_bce_loss,disc_loss,mmd_loss,isometry_loss,run_time\n')
             log_file.close()
+
+        ### Contrastive loss
+        contrastive_loss = ptlosses.SupConLoss() # supervised contrastive loss
 
         ### Initialize Annealer
         kl_annealer = KLAnnealer(self.params['BETA_INIT'], self.params['BETA'],
                                  epochs, self.params['ANNEAL_START'])
+        
+        contrastive_kl_start = 0.01
+        property_init = 0.0
+        property_final= 1.0 if use_contrastive_loss is False else 0.0
+        print(f"property_final = {property_final} property_init = {property_init}")
+        _total_epochs = epochs
+        if self.n_epochs>0:
+            _total_epochs = self.n_epochs + epochs
+            _m = (1.0-contrastive_kl_start)/(_total_epochs-self.params["ANNEAL_START"])
+            contrastive_kl_start = _m*self.n_epochs + contrastive_kl_start
+
+            property_init = ((property_final-property_init)/(_total_epochs))*self.n_epochs
+        contrastive_annealer = KLAnnealer(contrastive_kl_start, 1.0,
+                                          _total_epochs, self.params['ANNEAL_START'])
+        
+        property_annealer = KLAnnealer(property_init, property_final, epochs, 0)
         ####################################################################################################
         ### Epoch loop start
         for epoch in range(epochs):
@@ -232,10 +280,30 @@ class VAEShell():
                     dist.barrier()
         
             epoch_start_time= perf_counter()
+
+            # linearly ramp up the isometry loss
+            isometry_loss_weighting = 1.0#min(epochs//2, epoch*(epochs//2) ) 
+
+            ##################################
             ### Train Loop
+            ##################################
             self.model.train()
             losses = []
-            beta = kl_annealer(epoch)
+            recon_losses = []
+            prop_losses  = []
+            kld_losses   = []
+            contrastive_losses = []
+            if self.loaded_from is not None:
+                # +1 because epoch is 0-indexed, and we don't want to repeat the last
+                # beta value from the previous training session
+                beta = kl_annealer(epoch+1)
+                beta_contrastive = contrastive_annealer(epoch+1)
+                beta_property = property_annealer(epoch+1+self.n_epochs)
+            else:
+                beta = kl_annealer(epoch)
+                beta_contrastive = contrastive_annealer(epoch)
+                beta_property = property_annealer(epoch+self.n_epochs)
+
             for j, data in enumerate(train_iter):
                 avg_losses          = []
                 avg_bce_losses      = []
@@ -244,13 +312,31 @@ class VAEShell():
                 avg_prop_bce_losses = []
                 avg_disc_losses     = []
                 avg_mmd_losses      = []
-                avg_rmsd_losses     = []
+                avg_isometry_losses     = []
+                avg_contrastive_losses = []
                 start_run_time = perf_counter()
                 
                 for i in range(self.params['BATCH_CHUNKS']):
                     batch_data = data[i*self.chunk_size:(i+1)*self.chunk_size,:]
                     mols_data  = batch_data[:,                        :-self.params["d_pp_out"]]
                     props_data = batch_data[:,-self.params["d_pp_out"]:                        ]
+
+                    # sample sequences w distances
+                    if use_isometry_loss:
+                        n_to_grab = max(5, int(self.chunk_size*0.1) ) # grab 10% of the batch, or 5
+                        idxs = np.random.choice(len(train_data_w_distances), n_to_grab, replace=False)
+                        batch_data_w_distances = np.take(
+                            train_data_w_distances, idxs, axis=0
+                        )
+                        mols_data_w_distances = batch_data_w_distances[:, :-1]
+
+                        # now replace some of the sequences with the ones with distances
+                        n_to_replace = n_to_grab
+                        replace_idxs = np.random.choice(self.chunk_size, n_to_replace, replace=False)
+                        mols_data[replace_idxs] = mols_data_w_distances
+                        logging.info(f"grabbed {n_to_grab} sequences with distances")
+
+                    #Move data to GPU if available
                     if 'gpu' in self.params['HARDWARE']:
                         mols_data  =  mols_data.cuda()
                         props_data = props_data.cuda()
@@ -267,7 +353,18 @@ class VAEShell():
                                                                             true_len, pred_len,
                                                                             true_prop, pred_prop,
                                                                             self.params['CHAR_WEIGHTS'], self,
-                                                                            beta)
+                                                                            beta, beta_property=beta_property)
+                        if use_contrastive_loss:
+                            if true_prop.shape[1] == 1:
+                                _normalized_mu = mu / torch.linalg.vector_norm(mu, dim=1, ord=2, keepdim=True)
+                                _contrastive_loss = contrastive_loss(_normalized_mu, true_prop.flatten())
+                            else:
+                                error_msg = f"contrastive loss only supported for single property, not {true_prop.shape=}"
+                                raise ValueError(error_msg)
+                            loss = loss + _contrastive_loss
+                        else:
+                            _contrastive_loss = torch.tensor(0.0)
+
                         avg_bcemask_losses.append(bce_mask.item())
                         
                     if self.model_type == 'aae': #the aae loss is calculated in the forward function due to the 2 backward passes
@@ -293,9 +390,9 @@ class VAEShell():
                                                                   self.params['CHAR_WEIGHTS'], self,
                                                                   beta)
 
-                    if use_structure_loss:
+                    if use_isometry_loss:
                         if "peptide" not in self.name:
-                            raise ValueError("Structure loss only supported for peptide models")
+                            raise ValueError("isometry loss only supported for peptide models")
                         _total_n_pairs_to_use = len(mu) # total number might be large, so use a random subset
                         # N choose 2 = N! / 2!(N-2)! = N(N-1)/2 = M
                         # N^2 - N - 2M = 0
@@ -303,27 +400,50 @@ class VAEShell():
                         _choose_n = (1 + np.sqrt(1 + 8*_total_n_pairs_to_use))/2
                         _choose_n = int(_choose_n)
                         _idx = np.random.choice(len(mu), _choose_n, replace=False)
-                        mu_subset            =        mu[_idx]
-                        x_structures_subset  = mols_data[_idx]
-                        x_structures_subset_seq = decode_seq(x_structures_subset, self.params['CHAR_DICT'])
-                        keep_indices = []
-                        for i, seq in enumerate(x_structures_subset_seq):
-                            if len(seq)>=16: # threshold for CEAlign from biopython
-                                keep_indices.append(i)
-                        mu_subset = mu_subset[keep_indices]
-                        structures_pdbs  = structure_predictor.predict_structures(x_structures_subset_seq) 
-                        biostructures = structure_predictor.pdb_to_biostructure(structures_pdbs)
-                        rmsd_loss = deep_rmsd_isometry_loss(mu_subset, biostructures)
-                        # increase the total loss by the rmsd loss
-                        loss = loss + rmsd_loss
-                    else:
-                        rmsd_loss = torch.tensor(0.0)
+                        _idx = replace_idxs # use the same indices as above
+                        ######################
+                        # get distance_targets
+                        # must decode sequences in batch
+                        ######################
+                        _sequences = mols_data[_idx]
+                        _sequence_subset = decode_seq(_sequences, self.params['CHAR_DICT'])
 
-                    avg_losses.append(              loss.item())
+                        # latent points
+                        mu_subset = mu[_idx]
+                        
+                        isometry_loss = deep_isometry_loss(mu_subset, _sequence_subset, pairwise_distances, beta=beta_contrastive)
+                        # isometry_loss = deep_isometry_loss(mu_subset, _sequence_subset, pairwise_distances)
+                        # increase the total loss by the rmsd loss
+                        loss = loss + isometry_loss_weighting*isometry_loss
+                    else:
+                        isometry_loss = torch.tensor(0.0)
+                    
+                    # perform all reduce if distributed training
+                    if self.params['DDP']:
+                        loss_reduced = reduce_tensor(loss)
+                        bce          = reduce_tensor(bce)
+                        kld          = reduce_tensor(kld)
+                        if prop_bce.device.type == 'cuda':
+                            prop_bce = reduce_tensor(prop_bce)
+
+                        if use_isometry_loss:
+                            isometry_loss = reduce_tensor(isometry_loss)
+                        else:
+                            isometry_loss = torch.tensor(0.0)
+
+                        if use_contrastive_loss:
+                            _contrastive_loss = reduce_tensor(_contrastive_loss)
+                        else:
+                            _contrastive_loss = torch.tensor(0.0)
+                    
+                        avg_losses.append(  loss_reduced.item())
+                    else:
+                        avg_losses.append(          loss.item())
                     avg_bce_losses.append(           bce.item())
                     avg_kld_losses.append(           kld.item())
                     avg_prop_bce_losses.append( prop_bce.item())
-                    avg_rmsd_losses.append(    rmsd_loss.item())
+                    avg_isometry_losses.append(    isometry_loss.item())
+                    avg_contrastive_losses.append( _contrastive_loss.item())
 
                     if not self.model_type == 'aae': #the aae backpropagates in the loss function
                         loss.backward()
@@ -334,7 +454,7 @@ class VAEShell():
                     self.model.zero_grad()
                 stop_run_time = perf_counter()
                 run_time = round(stop_run_time - start_run_time, 5)
-                avg_loss = np.mean(avg_losses)
+                avg_loss = np.mean(    avg_losses)
                 avg_bce  = np.mean(avg_bce_losses)
                 if len(avg_bcemask_losses) == 0:
                     avg_bcemask = 0
@@ -351,8 +471,14 @@ class VAEShell():
 
                 avg_kld      = np.mean(avg_kld_losses)
                 avg_prop_bce = np.mean(avg_prop_bce_losses)
-                avg_rmsd     = np.mean(avg_rmsd_losses)
+                # avg_rmsd     = np.mean(avg_isometry_losses)
+                avg_rmsd     = np.mean(avg_contrastive_losses)
+                
                 losses.append(avg_loss)
+                recon_losses.append(avg_bce)
+                prop_losses.append(avg_prop_bce)
+                kld_losses.append(avg_kld)
+                contrastive_losses.append(avg_rmsd)
 
                 if log:
                     log_file = open(log_fn, 'a')
@@ -368,11 +494,22 @@ class VAEShell():
                                                                          avg_rmsd,
                                                                          run_time))
                     log_file.close()
-            train_loss = np.mean(losses)
-
-            ### Val Loop
+            train_loss      = np.mean(losses)
+            train_bce_loss  = np.mean(recon_losses)
+            train_prop_loss = np.mean(prop_losses)
+            train_kld_loss  = np.mean(kld_losses)
+            train_rmsd_loss = np.mean(contrastive_losses)
+            
+            
+            ##############################
+            ### Validation Loop
+            ##############################
             self.model.eval()
             losses = []
+            recon_losses = []
+            prop_losses  = []
+            kld_losses   = []
+            contrastive_losses = []   
             for j, data in enumerate(val_iter):
                 avg_losses          = []
                 avg_bce_losses      = []
@@ -381,12 +518,30 @@ class VAEShell():
                 avg_prop_bce_losses = []
                 avg_disc_losses     = []
                 avg_mmd_losses      = []
-                avg_rmsd_losses     = []
+                avg_isometry_losses     = []
+                avg_contrastive_losses = []
+
                 start_run_time = perf_counter()
                 for i in range(self.params['BATCH_CHUNKS']):
                     batch_data = data[i*self.chunk_size:(i+1)*self.chunk_size,:]
                     mols_data  = batch_data[:,                        :-self.params["d_pp_out"]]
                     props_data = batch_data[:,-self.params["d_pp_out"]:                        ]
+                    
+                    # sample sequences w distances
+                    if use_isometry_loss:
+                        n_to_grab = max(5, int(self.chunk_size*0.1) ) # grab 10% of the batch, or 5
+                        idxs = np.random.choice(len(val_data_w_distances), n_to_grab, replace=False)
+                        batch_data_w_distances = np.take(
+                            val_data_w_distances, idxs, axis=0
+                        )
+                        mols_data_w_distances = batch_data_w_distances[:, :-1]
+
+                        # now replace some of the sequences with the ones with distances
+                        n_to_replace = n_to_grab
+                        replace_idxs = np.random.choice(self.chunk_size, n_to_replace, replace=False)
+                        mols_data[replace_idxs] = mols_data_w_distances
+
+                    # move to GPU if available
                     if 'gpu' in self.params['HARDWARE']:
                         mols_data = mols_data.cuda()
                         props_data = props_data.cuda()
@@ -404,8 +559,20 @@ class VAEShell():
                                                                             true_len, pred_len,
                                                                             true_prop, pred_prop,
                                                                             self.params['CHAR_WEIGHTS'], self,
-                                                                            beta)
+                                                                            beta, beta_property=beta_property)
                         avg_bcemask_losses.append(bce_mask.item())
+
+                        if use_contrastive_loss:
+                            # _contrastive_loss = contrastive_loss(mu, true_prop)
+                            if true_prop.shape[1] == 1:
+                                _normalized_mu = mu / torch.linalg.vector_norm(mu, dim=1, ord=2, keepdim=True)
+                                _contrastive_loss = contrastive_loss(_normalized_mu, true_prop.flatten())
+                            else:
+                                error_msg = f"contrastive loss only supported for single property, not {true_prop.shape=}"
+                                raise ValueError(error_msg)
+                            loss = loss + _contrastive_loss
+                        else:
+                            _contrastive_loss = torch.tensor(0.0)
                         
                     if self.model_type == 'aae':
                         loss, bce, kld, prop_bce, disc_loss = self.model(src, tgt, true_prop,self.params['CHAR_WEIGHTS'], beta,
@@ -429,7 +596,7 @@ class VAEShell():
                                                                   self.params['CHAR_WEIGHTS'], self,
                                                                   beta)
                     
-                    if use_structure_loss:
+                    if use_isometry_loss:
                         if "peptide" not in self.name:
                             raise ValueError("Structure loss only supported for peptide models")
                         _total_n_pairs_to_use = len(mu) # total number might be large, so use a random subset
@@ -439,32 +606,55 @@ class VAEShell():
                         _choose_n = (1 + np.sqrt(1 + 8*_total_n_pairs_to_use))/2
                         _choose_n = int(_choose_n)
                         _idx = np.random.choice(len(mu), _choose_n, replace=False)
-                        mu_subset            =           mu[_idx]
-                        x_structures_subset  = mols_data[_idx]
-                        x_structures_subset_seq = decode_seq(x_structures_subset, self.params['CHAR_DICT'])
-                        keep_indices = []
-                        for i, seq in enumerate(x_structures_subset_seq):
-                            if len(seq)>=16: # threshold for CEAlign from biopython
-                                keep_indices.append(i)
-                        mu_subset = mu_subset[keep_indices]
-                        structures_pdbs  = structure_predictor.predict_structures(x_structures_subset_seq) # FLAG: needs to be list[str] input
-                        biostructures = structure_predictor.pdb_to_biostructure(structures_pdbs)
-                        rmsd_loss = deep_rmsd_isometry_loss(mu_subset, biostructures)
-                        # increase the total loss by the rmsd loss
-                        loss = loss + rmsd_loss
-                    else:
-                        rmsd_loss = torch.tensor(0.0)
+                        _idx = replace_idxs # use the same indices as above
+                        ######################
+                        # get distance_targets
+                        # must decode sequences in batch
+                        ######################
+                        _sequences = mols_data[_idx]
+                        _sequence_subset = decode_seq(_sequences, self.params['CHAR_DICT'])
 
-                    avg_losses.append(             loss.item())
+                        # latent points
+                        mu_subset = mu[_idx]
+                        
+                        isometry_loss = deep_isometry_loss(mu_subset, _sequence_subset, pairwise_distances,beta=beta_contrastive)
+                        # isometry_loss = deep_isometry_loss(mu_subset, _sequence_subset, pairwise_distances)
+                        # increase the total loss by the rmsd loss
+                        loss = loss + isometry_loss
+                    else:
+                        isometry_loss = torch.tensor(0.0)
+
+                    # perform all reduce if distributed training
+                    if self.params['DDP']:
+                        loss_reduced = reduce_tensor(loss)
+                        bce          = reduce_tensor(bce)
+                        kld          = reduce_tensor(kld)
+                        if prop_bce.device.type == 'cuda':
+                            prop_bce = reduce_tensor(prop_bce)
+                        
+                        if use_isometry_loss:
+                            isometry_loss = reduce_tensor(isometry_loss)
+                        else:
+                            isometry_loss = torch.tensor(0.0)
+                        
+                        if use_contrastive_loss:
+                            _contrastive_loss = reduce_tensor(_contrastive_loss)
+                        else:
+                            _contrastive_loss = torch.tensor(0.0)
+
+                        avg_losses.append(     loss_reduced.item())
+                    else:
+                        avg_losses.append(         loss.item())
                     avg_bce_losses.append(          bce.item())
                     avg_kld_losses.append(          kld.item())
                     avg_prop_bce_losses.append(prop_bce.item())
-                    avg_rmsd_losses.append(   rmsd_loss.item())
+                    avg_isometry_losses.append(   isometry_loss.item())
+                    avg_contrastive_losses.append(_contrastive_loss.item())
 
                 stop_run_time = perf_counter()
                 run_time = round(stop_run_time - start_run_time, 5)
-                avg_loss = np.mean(avg_losses)
-                avg_bce = np.mean(avg_bce_losses)
+                avg_loss = np.mean(    avg_losses)
+                avg_bce  = np.mean(avg_bce_losses)
                 if len(avg_bcemask_losses) == 0:
                     avg_bcemask = 0
                 else:
@@ -480,9 +670,14 @@ class VAEShell():
                 
                 avg_kld      = np.mean(avg_kld_losses)
                 avg_prop_bce = np.mean(avg_prop_bce_losses)
-                avg_rmsd     = np.mean(avg_rmsd_losses)
+                # avg_rmsd     = np.mean(avg_isometry_losses)
+                avg_rmsd     = np.mean(avg_contrastive_losses)
+
                 losses.append(avg_loss)
-                
+                recon_losses.append(avg_bce)
+                prop_losses.append(avg_prop_bce)
+                kld_losses.append(avg_kld)
+                contrastive_losses.append(avg_rmsd)   
                 if log:
                     log_file = open(log_fn, 'a')
                     log_file.write('{},{},{},{},{},{},{},{},{},{},{},{}\n'.format(self.n_epochs,
@@ -499,14 +694,64 @@ class VAEShell():
                     log_file.close()
 
             self.n_epochs += 1
-            val_loss = np.mean(losses)
+            val_loss      = np.mean(            losses)
+            val_bce_loss  = np.mean(      recon_losses)
+            val_prop_loss = np.mean(       prop_losses)
+            val_kld_loss  = np.mean(        kld_losses)
+            val_rmsd_loss = np.mean(contrastive_losses)
             epoch_end_time = perf_counter()
             epoch_time = round(epoch_start_time - epoch_end_time, 5)
             if self.params['DDP']:
-                os.system("echo Epoch - {} Train - {} Val - {} KLBeta - {} Epoch time - {}".format(self.n_epochs, train_loss, val_loss, beta, epoch_time))
+                os.system("echo from rank {} Epoch - {} Train - {} Val - {} KLBeta - {} Epoch time - {}".format(rank, self.n_epochs, train_loss, val_loss, beta, epoch_time))
+
+                if (comet_experiment is not None) and (rank==0):
+                    _comet_package = {
+                        "train_loss": train_loss,
+                        "train_reconstruction_loss": train_bce_loss,
+                        "train_kld_loss": train_kld_loss,
+                        "train_property_loss": train_prop_loss,
+                        "train_contrastive_loss": train_rmsd_loss,
+
+                        "val_loss": val_loss,
+                        "val_reconstruction_loss": val_bce_loss,
+                        "val_kld_loss": val_kld_loss,
+                        "val_property_loss": val_prop_loss,
+                        "val_contrastive_loss": val_rmsd_loss,
+
+                        "kl_beta": beta,
+                        "prop_beta": beta_property,
+                        "epoch_time": epoch_time
+                    }
+                    comet_experiment.log_metrics(_comet_package, step=self.n_epochs)
             else:
                 print('Epoch - {} Train - {} Val - {} KLBeta - {} Epoch time - {}'.format(self.n_epochs, train_loss, val_loss, beta, epoch_time))
+                
+                if comet_experiment is not None:
+                    _comet_package = {
+                        "train_loss": train_loss,
+                        "train_reconstruction_loss": train_bce_loss,
+                        "train_kld_loss": train_kld_loss,
+                        "train_property_loss": train_prop_loss,
+                        "train_contrastive_loss": train_rmsd_loss,
 
+                        "val_loss": val_loss,
+                        "val_reconstruction_loss": val_bce_loss,
+                        "val_kld_loss": val_kld_loss,
+                        "val_property_loss": val_prop_loss,
+                        "val_contrastive_loss": val_rmsd_loss,
+
+                        "kl_beta": beta,
+                        "prop_beta": beta_property,
+                        "epoch_time": epoch_time
+                    }
+                    comet_experiment.log_metrics(_comet_package, step=self.n_epochs)
+
+            ### check if any loss has NaNed out, system exit with message and error code
+            if np.isnan(train_loss) or np.isnan(val_loss):
+                sys.exit("Loss is NaN, exiting")
+            # also check if inf
+            if np.isinf(train_loss) or np.isinf(val_loss):
+                sys.exit("Loss is inf, exiting")
             ### Update current state and save model
             self.current_state['epoch'] = self.n_epochs
             self.current_state['model_state_dict'] = self.model.state_dict()
@@ -522,9 +767,9 @@ class VAEShell():
                 if save:                
                     if self.params['DDP']:
                         if rank ==0:
-                            self.save(self.current_state, epoch_str)
+                            self.save(self.current_state, epoch_str,path=self.params['save_dir'])
                     else: 
-                        self.save(self.current_state, epoch_str)
+                        self.save(self.current_state, epoch_str,path=self.params['save_dir'])
 
     ### Sampling and Decoding Functions
     def sample_from_memory(self, size, mode='rand', sample_dims=None, k=5):
@@ -555,7 +800,7 @@ class VAEShell():
                     z[:,d] = torch.randn(size)
         return z
 
-    def greedy_decode(self, mem, print_step=100 ,src_mask=None):
+    def greedy_decode(self, mem, print_step=100 ,src_mask=None, return_probabilities=False, verbose=False):
         """
         Greedy decode from model memory if the model is a transformer
         Otherwise just decode from memory
@@ -568,10 +813,14 @@ class VAEShell():
             decoded (torch.tensor): Tensor of predicted token ids
         """
         start_symbol = self.params['CHAR_DICT']['<start>']
+        end_symbol   = self.params['CHAR_DICT']['<end>']
         max_len = self.tgt_len
         decoded = torch.ones(mem.shape[0],1).fill_(start_symbol).long()
         tgt = torch.ones(mem.shape[0],max_len+1).fill_(start_symbol).long()
         
+        if return_probabilities:
+            probabilities = torch.ones((mem.shape[0], max_len, self.vocab_size-1)) # -1 to remove predicting start token 
+
         if src_mask is None and self.model_type == 'transformer':
             mask_lens = self.model.encoder.predict_mask_length(mem)
             src_mask = torch.zeros((mem.shape[0], 1, self.src_len+1))
@@ -589,7 +838,8 @@ class VAEShell():
 
         self.model.eval()
         for i in range(max_len):
-            if i%print_step==0: print("decoding sequences of max length ",max_len,"current position: ",i)
+            if verbose:
+                if i%print_step==0: print("decoding sequences of max length ",max_len,"current position: ",i)
             if self.model_type == 'transformer':
                 decode_mask = Variable(subsequent_mask(decoded.size(1)).long())
                 if 'gpu' in self.params['HARDWARE']:
@@ -600,15 +850,26 @@ class VAEShell():
             out = self.model.generator(out)
             prob = F.softmax(out[:,i,:], dim=-1)
             _, next_word = torch.max(prob, dim=1)
-            next_word += 1
+            next_word += 1  # to ignore predicting a start token
             tgt[:,i+1] = next_word
             if self.model_type == 'transformer':
                 next_word = next_word.unsqueeze(1)
                 decoded = torch.cat([decoded, next_word], dim=1)
-        decoded = tgt[:,1:]
-        return decoded
+            
+            if return_probabilities:
+                probabilities[:,i,:] = prob
 
-    def reconstruct(self, data, method='greedy', log=True, return_mems=True, return_str=True):
+            # stop if generate <end> token
+            if next_word==end_symbol:
+                break
+        
+        decoded = tgt[:,1:]
+        if return_probabilities:
+            return decoded, probabilities    
+        else:
+            return decoded
+
+    def reconstruct(self, data, method='greedy', log=True, return_mems=True, return_str=True, return_probabilities=False):
         """
         Method for encoding input smiles into memory and decoding back
         into smiles
@@ -622,13 +883,19 @@ class VAEShell():
             return_mems (bool): If true, returns memory vectors in addition to decoded SMILES
             return_str (bool): If true, translates decoded vectors into SMILES strings. If false
                                returns tensor of token ids
+            return_probabilities (bool): If true, returns probabilities of each token at each position
+                                        useful for computing perplexity/entropy/etc.
         Returns:
             decoded_smiles (list): Decoded smiles data - either decoded SMILES strings or tensor of
                                    token ids
             mems (np.array): Array of model memory vectors
         """
         with torch.no_grad():
-            data = vae_data_gen(data,max_len=self.src_len,name=self.name, char_dict=self.params['CHAR_DICT'])
+            data = vae_data_gen(data,
+                                max_len=self.src_len,
+                                name=self.name, 
+                                char_dict=self.params['CHAR_DICT'],
+                                d_pp_out=self.params['d_pp_out'])
             data_iter = torch.utils.data.DataLoader(data,
                                                     batch_size=self.params['BATCH_SIZE'],
                                                     shuffle=False, num_workers=0,
@@ -676,7 +943,13 @@ class VAEShell():
                     
                     ### Decode logic
                     if method == 'greedy':
-                        decoded = self.greedy_decode(mem, src_mask=src_mask)
+                        decoded = self.greedy_decode(
+                            mem, 
+                            src_mask=src_mask, 
+                            return_probabilities=return_probabilities
+                        )
+                        if return_probabilities:
+                            decoded, probabilities = decoded # unpack tuple
                     else:
                         decoded = None
 
@@ -686,8 +959,12 @@ class VAEShell():
                     else:
                         decoded_sequences.append(decoded)
 
-            if return_mems:
+            if return_mems and not return_probabilities:
                 return decoded_sequences, decoded_properties, mems.detach().numpy()
+            elif not return_mems and return_probabilities:
+                return decoded_sequences, decoded_properties, probabilities
+            elif return_mems and return_probabilities:
+                return decoded_sequences, decoded_properties, mems.detach().numpy(), probabilities
             else:
                 return decoded_sequences, decoded_properties
 
@@ -741,7 +1018,11 @@ class VAEShell():
             mus(np.array): Mean memory array (prior to reparameterization)
             logvars(np.array): Log variance array (prior to reparameterization)
         """
-        data = vae_data_gen(data, max_len=self.src_len,name=self.name,props=None, char_dict=self.params['CHAR_DICT'])
+        data, _ = vae_data_gen(data, 
+                            max_len=self.src_len,
+                            name=self.name,props=None, 
+                            char_dict=self.params['CHAR_DICT'],
+                            d_pp_out=self.params["d_pp_out"])
 
         data_iter = torch.utils.data.DataLoader(data,
                                                 batch_size=self.params['BATCH_SIZE'],
@@ -754,7 +1035,6 @@ class VAEShell():
         mus  = torch.empty((save_shape, self.params['d_latent'])).cpu()
         logvars = torch.empty((save_shape, self.params['d_latent'])).cpu()
         self.model.eval()
-
         for j, data in enumerate(data_iter):
             if log:
                 log_file = open('memory/{}_progress.txt'.format(self.name), 'a')
@@ -764,6 +1044,7 @@ class VAEShell():
                 batch_data = data[i*self.chunk_size:(i+1)*self.chunk_size,:]
                 mols_data  = batch_data[:,                        :-self.params["d_pp_out"]]
                 props_data = batch_data[:,-self.params["d_pp_out"]:                        ]
+                print(f"{mols_data.shape=}, {props_data.shape=}")
                 if 'gpu' in self.params['HARDWARE']:
                     mols_data = mols_data.cuda()
                     props_data = props_data.cuda()
@@ -830,7 +1111,7 @@ class ConvBottleneck(nn.Module):
 
     def forward(self, x):
         for conv in self.conv_layers:
-            x = F.relu(conv(x))
+            x = F.leaky_relu(conv(x))
         return x
 
 class DeconvBottleneck(nn.Module):
@@ -860,7 +1141,7 @@ class DeconvBottleneck(nn.Module):
 
     def forward(self, x):
         for deconv in self.deconv_layers:
-            x = F.relu(deconv(x))
+            x = F.leaky_relu(deconv(x))
         return x
 
 ############## Generator #################
@@ -926,7 +1207,7 @@ class PropertyPredictor(nn.Module):
                 if condn1:
                     x = self._last_layer_nn(x, prediction_layer)
                 else:
-                    x = torch.relu(prediction_layer(x))
+                    x = F.leaky_relu(prediction_layer(x))
         return x
 
 ############## Embedding Layers ###################
